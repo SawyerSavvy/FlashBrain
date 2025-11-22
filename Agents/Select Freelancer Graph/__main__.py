@@ -1,0 +1,99 @@
+import logging
+import os
+import sys
+
+import click
+import httpx
+import uvicorn
+from dotenv import load_dotenv
+
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import (
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore,
+    InMemoryTaskStore,
+)
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+)
+
+from select_freelancer_agent import SelectFreelancerAgent
+from agent_executor import SelectFreelancerAgentExecutor
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@click.command()
+@click.option('--host', 'host', default='localhost')
+@click.option('--port', 'port', default=8012)
+def main(host, port):
+    """Starts the Select Freelancer Agent server."""
+    try:
+        # Check required environment variables
+        required_vars = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SELECT_FREELANCER_URL']
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+
+        if missing_vars:
+            logger.warning(f'Missing environment variables: {", ".join(missing_vars)}. Some functionality may be limited.')
+
+        capabilities = AgentCapabilities(streaming=True, push_notifications=True)
+
+        select_freelancer_skill = AgentSkill(
+            id='select_freelancer',
+            name='Select Freelancer',
+            description='Updates project phases and roles in Supabase based on user input, then matches freelancers.',
+            tags=['freelancer', 'selection', 'matching'],
+            examples=[
+                'Update the frontend developer role requirements',
+                'Add a new phase for testing',
+                'Match freelancers for my project'
+            ],
+        )
+
+        agent_card = AgentCard(
+            name='Select Freelancer Agent',
+            description='An agent that manages project phases and roles, and selects freelancers based on requirements.',
+            url=f'http://{host}:{port}/',
+            version='1.0.0',
+            default_input_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
+            default_output_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
+            capabilities=capabilities,
+            skills=[select_freelancer_skill],
+        )
+
+        # Create request handler
+        httpx_client = httpx.AsyncClient()
+        push_config_store = InMemoryPushNotificationConfigStore()
+        push_sender = BasePushNotificationSender(
+            httpx_client=httpx_client,
+            config_store=push_config_store
+        )
+
+        request_handler = DefaultRequestHandler(
+            agent_executor=SelectFreelancerAgentExecutor(),
+            task_store=InMemoryTaskStore(),
+            push_config_store=push_config_store,
+            push_sender=push_sender
+        )
+
+        server = A2AStarletteApplication(
+            agent_card=agent_card,
+            http_handler=request_handler
+        )
+
+        logger.info(f'Starting Select Freelancer Agent on {host}:{port}')
+        uvicorn.run(server.build(), host=host, port=port)
+
+    except Exception as e:
+        logger.error(f'An error occurred during server startup: {e}')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
