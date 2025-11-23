@@ -8,12 +8,10 @@ import json
 
 import httpx
 
-from a2a.client import A2ACardResolver, A2AClient
+from a2a.client import A2ACardResolver, ClientFactory, ClientConfig
 from a2a.types import (
     AgentCard,
-    MessageSendParams,
-    SendMessageRequest,
-    SendStreamingMessageRequest,
+    Message,
 )
 from a2a.utils.constants import (
     AGENT_CARD_WELL_KNOWN_PATH,
@@ -28,7 +26,7 @@ async def main() -> None:
 
     base_url = 'http://localhost:8013'
 
-    async with httpx.AsyncClient() as httpx_client:
+    async with httpx.AsyncClient(timeout=30.0) as httpx_client:
         # Initialize A2ACardResolver
         resolver = A2ACardResolver(
             httpx_client=httpx_client,
@@ -42,7 +40,14 @@ async def main() -> None:
             logger.info(
                 f'Attempting to fetch public agent card from: {base_url}{AGENT_CARD_WELL_KNOWN_PATH}'
             )
-            _public_card = await resolver.get_agent_card()
+            try:
+                _public_card = await resolver.get_agent_card()
+            except Exception as e:
+                logger.warning(f"Standard fetch failed: {e}. Trying fallback to /a2a/agent.json")
+                # Fallback to /a2a/agent.json
+                resp = await httpx_client.get(f"{base_url}/a2a/agent.json")
+                resp.raise_for_status()
+                _public_card = AgentCard.model_validate(resp.json())
             logger.info('Successfully fetched public agent card:')
             logger.info(
                 _public_card.model_dump_json(indent=2, exclude_none=True)
@@ -98,11 +103,22 @@ async def main() -> None:
                 'Failed to fetch the public agent card. Cannot continue.'
             ) from e
 
-        # Initialize A2A Client
-        client = A2AClient(
-            httpx_client=httpx_client, agent_card=final_agent_card_to_use
+        # Initialize A2A Client using ClientFactory
+        client_config = ClientConfig(httpx_client=httpx_client)
+        client = await ClientFactory.connect(
+            agent=final_agent_card_to_use,
+            client_config=client_config
         )
-        logger.info('A2AClient initialized.')
+        logger.info('A2AClient initialized via ClientFactory.')
+
+        # Helper to print responses
+        async def print_responses(iterator):
+            async for item in iterator:
+                if isinstance(item, tuple):
+                    task, update = item
+                    print(f"Update: {update}")
+                else:
+                    print(f"Message: {item}")
 
         # Test 1: Summarize a conversation
         logger.info('\n=== Test 1: Summarize Conversation History ===')
@@ -119,79 +135,51 @@ async def main() -> None:
 
         messages_json = json.dumps({"messages": messages, "keep_last": 2})
 
-        send_message_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {'kind': 'text', 'text': messages_json}
-                ],
-                'message_id': uuid4().hex,
-            },
+        message_data = {
+            'role': 'user',
+            'parts': [
+                {'kind': 'text', 'text': messages_json}
+            ],
+            'message_id': uuid4().hex,
         }
-        request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
-
-        response = await client.send_message(request)
-        print('\nResponse:')
-        print(response.model_dump(mode='json', exclude_none=True))
+        message = Message(**message_data)
+        await print_responses(client.send_message(message))
 
         # Test 2: Summarize with different keep_last value
         logger.info('\n=== Test 2: Summarize with Keep Last 3 ===')
 
         messages_json_2 = json.dumps({"messages": messages, "keep_last": 3})
 
-        summarize_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {'kind': 'text', 'text': messages_json_2}
-                ],
-                'message_id': uuid4().hex,
-            },
+        summarize_message_data = {
+            'role': 'user',
+            'parts': [
+                {'kind': 'text', 'text': messages_json_2}
+            ],
+            'message_id': uuid4().hex,
         }
-        summarize_request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**summarize_payload)
-        )
-
-        summarize_response = await client.send_message(summarize_request)
-        print('\nSummarize Response:')
-        print(summarize_response.model_dump(mode='json', exclude_none=True))
+        summarize_message = Message(**summarize_message_data)
+        await print_responses(client.send_message(summarize_message))
 
         # Test 3: Simple text summarization
         logger.info('\n=== Test 3: Simple Text Summarization ===')
 
-        simple_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {
-                        'kind': 'text',
-                        'text': 'Summarize this conversation about building a mobile app with authentication and real-time features',
-                    }
-                ],
-                'message_id': uuid4().hex,
-            },
+        simple_message_data = {
+            'role': 'user',
+            'parts': [
+                {
+                    'kind': 'text',
+                    'text': 'Summarize this conversation about building a mobile app with authentication and real-time features',
+                }
+            ],
+            'message_id': uuid4().hex,
         }
-        simple_request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**simple_payload)
-        )
+        simple_message = Message(**simple_message_data)
+        await print_responses(client.send_message(simple_message))
 
-        simple_response = await client.send_message(simple_request)
-        print('\nSimple Response:')
-        print(simple_response.model_dump(mode='json', exclude_none=True))
-
-        # Test 4: Streaming response
-        logger.info('\n=== Test 4: Streaming Summarization ===')
-        streaming_request = SendStreamingMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
-
-        stream_response = client.send_message_streaming(streaming_request)
-
-        print('\nStreaming Response:')
-        async for chunk in stream_response:
-            print(chunk.model_dump(mode='json', exclude_none=True))
+        # Test 4: Streaming response (Implicit in new client)
+        logger.info('\n=== Test 4: Streaming Summarization (Implicit) ===')
+        # Re-using message from Test 1
+        await print_responses(client.send_message(message))
 
 
 if __name__ == '__main__':

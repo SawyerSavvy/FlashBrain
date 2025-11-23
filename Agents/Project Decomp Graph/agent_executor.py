@@ -34,11 +34,25 @@ class ProjectDecompAgentExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
+        """
+        context config: 
+            message: Message
+                context_id: str
+                message_id: str
+                parts: List[Part] (Contains the user input, artifact, or system message)
+                metadata: { 
+                            'project_id': str,
+                            'client_id': str,
+                            'exist': bool (True if project exists, Flase if project does not exist)
+                        }
+        """
         error = self._validate_request(context)
         if error:
             raise ServerError(error=InvalidParamsError())
 
+        # Extract user input from message parts
         query = context.get_user_input()
+
         task = context.current_task
         if not task:
             task = new_task(context.message)  # type: ignore

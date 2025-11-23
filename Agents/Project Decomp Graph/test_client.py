@@ -115,6 +115,11 @@ async def main() -> None:
                     }
                 ],
                 'message_id': uuid4().hex,
+                'metadata': { #Optional metadata associated with this part
+                    'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                    'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5',
+                    'exist': True
+                }
             },
         }
         request = SendMessageRequest(
@@ -173,19 +178,15 @@ async def main() -> None:
                     {
                         'kind': 'text', #Type of this part
                         'text': 'Update the existing project plan with new timeline', #String content of the text part
-                        'metadata': { #Optional metadata associated with this part
-                            'project_id': 'proj_12345',
-                            'client_id': 'client_abcde',
-                            'exist': True
-                        }
                     }
                 ],
+                'message_id': uuid4().hex,
+                'metadata': { #Optional metadata associated with this part
+                    'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                    'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5',
+                    'exist': True
+                }
             },
-            'metadata': { #Optional metadata associated with the message request
-                'project_id': 'proj_12345',
-                'client_id': 'client_abcde',
-                'exist': True
-            }
         }
         metadata_request = SendMessageRequest(
             id=str(uuid4()), params=MessageSendParams(**metadata_payload)

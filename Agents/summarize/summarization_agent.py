@@ -4,28 +4,16 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, message_to_dict, messages_from_dict
 from python_a2a import run_server, AgentCard, AgentSkill
 
-# Initialize the model
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
-
-summarization_skill = AgentSkill(
-    id='summarize_agent',
-    name="summarize",
-    description="Summarizes a list of messages. Returns the updated list of messages.",
-    tags=["summarization"],
-)
-
-AgentCard(
-    name="Summarization Agent",
-    description="An agent that summarizes conversation history.",
-    url="http://localhost:8013",  # Required parameter
-    version="0.3.0",
-    capabilities={"streaming": False},
-    skills=[summarization_skill],
-)
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
 class SummarizationAgent:
 
-    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
+    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain', 'application/json']
+
+    def __init__(self):
+        # Initialize the model
+        self.model = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
 
     async def stream(self, query: str, context_id: str = "default", keep_last: int = 2):
         """
@@ -70,7 +58,7 @@ class SummarizationAgent:
             yield {
                 'is_task_complete': True,
                 'require_user_input': False,
-                'content': f"Summarization complete. Condensed {len(messages)} messages into {len(summarized_messages)} messages."
+                'content': summary_text
             }
 
         except Exception as e:
@@ -171,7 +159,7 @@ class SummarizationAgent:
         {text}
         """
         try:
-            response = model.invoke(prompt)
+            response = self.model.invoke(prompt)
             return response.content
         except Exception as e:
             return f"Error summarizing text: {e}"
@@ -184,8 +172,8 @@ requirements = [
     # any other dependencies
 ]
 
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8013))
     print(f"Starting Summarization Agent on port {port}...")
-    run_server(SummarizationAgent(), port=port)
+    agent = SummarizationAgent()
+    run_server(agent, port=port)

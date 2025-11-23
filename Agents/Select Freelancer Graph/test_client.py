@@ -7,18 +7,18 @@ from uuid import uuid4
 
 import httpx
 
-from a2a.client import A2ACardResolver, A2AClient
+from a2a.client import A2ACardResolver, ClientFactory, ClientConfig
 from a2a.types import (
     AgentCard,
     MessageSendParams,
     SendMessageRequest,
     SendStreamingMessageRequest,
+    Message,
 )
 from a2a.utils.constants import (
     AGENT_CARD_WELL_KNOWN_PATH,
     EXTENDED_AGENT_CARD_PATH,
 )
-
 
 async def main() -> None:
     # Configure logging to show INFO level messages
@@ -27,7 +27,8 @@ async def main() -> None:
 
     base_url = 'http://localhost:8012'
 
-    async with httpx.AsyncClient() as httpx_client:
+    # Increase timeout to 30 seconds to handle long-running agent tasks
+    async with httpx.AsyncClient(timeout=30.0) as httpx_client:
         # Initialize A2ACardResolver
         resolver = A2ACardResolver(
             httpx_client=httpx_client,
@@ -97,92 +98,90 @@ async def main() -> None:
                 'Failed to fetch the public agent card. Cannot continue.'
             ) from e
 
-        # Initialize A2A Client
-        client = A2AClient(
-            httpx_client=httpx_client, agent_card=final_agent_card_to_use
+        # Initialize A2A Client using ClientFactory
+        client_config = ClientConfig(httpx_client=httpx_client)
+        client = await ClientFactory.connect(
+            agent=final_agent_card_to_use,
+            client_config=client_config
         )
-        logger.info('A2AClient initialized.')
+        logger.info('A2AClient initialized via ClientFactory.')
+
+        # Helper to print responses
+        async def print_responses(iterator):
+            async for item in iterator:
+                if isinstance(item, tuple):
+                    task, update = item
+                    print(f"Update: {update}")
+                else:
+                    print(f"Message: {item}")
 
         # Test 1: Update role requirements
         logger.info('\n=== Test 1: Update Role Requirements ===')
-        send_message_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {
-                        'kind': 'text',
-                        'text': 'Update the frontend developer role to require React and TypeScript experience',
-                    }
-                ],
-                'message_id': uuid4().hex,
-            },
+        message_data = {
+            'role': 'user',
+            'parts': [
+                {
+                    'kind': 'text',
+                    'text': 'Update the Security Engineer role to require React and TypeScript experience',
+                }
+            ],
+            'message_id': uuid4().hex,
+            'metadata': {
+                'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5',
+                'exist': True
+            }
         }
-        request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
-
-        response = await client.send_message(request)
-        print('\nResponse:')
-        print(response.model_dump(mode='json', exclude_none=True))
+        message = Message(**message_data)
+        await print_responses(client.send_message(message))
 
         # Test 2: Add new project phase
         logger.info('\n=== Test 2: Add New Project Phase ===')
-        phase_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {
-                        'kind': 'text',
-                        'text': 'Add a new testing phase that includes QA testing and user acceptance testing',
-                    }
-                ],
-                'message_id': uuid4().hex,
-            },
+        phase_message_data = {
+            'role': 'user',
+            'parts': [
+                {
+                    'kind': 'text',
+                    'text': 'Change the Security Engineer to a Quality Engineer',
+                }
+            ],
+            'message_id': uuid4().hex,
+            'metadata': {
+                'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5',
+                'exist': True
+            }
         }
-        phase_request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**phase_payload)
-        )
-
-        phase_response = await client.send_message(phase_request)
-        print('\nPhase Response:')
-        print(phase_response.model_dump(mode='json', exclude_none=True))
+        phase_message = Message(**phase_message_data)
+        await print_responses(client.send_message(phase_message))
 
         # Test 3: Match freelancers for project
         logger.info('\n=== Test 3: Match Freelancers ===')
-        match_payload: dict[str, Any] = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {
-                        'kind': 'text',
-                        'text': 'Find freelancers for my web development project with React and Node.js skills',
-                    }
-                ],
-                'message_id': uuid4().hex,
-            },
+        match_message_data = {
+            'role': 'user',
+            'parts': [
+                {
+                    'kind': 'text',
+                    'text': 'Add a AI Researcher role to the first project phase.',
+                }
+            ],
+            'message_id': uuid4().hex,
+            'metadata': {
+                'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5',
+                'exist': True
+            }
         }
-        match_request = SendMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**match_payload)
-        )
+        match_message = Message(**match_message_data)
+        await print_responses(client.send_message(match_message))
 
-        match_response = await client.send_message(match_request)
-        print('\nMatch Response:')
-        print(match_response.model_dump(mode='json', exclude_none=True))
-
-        # Test 4: Streaming response
-        logger.info('\n=== Test 4: Streaming Freelancer Selection ===')
-        streaming_request = SendStreamingMessageRequest(
-            id=str(uuid4()), params=MessageSendParams(**send_message_payload)
-        )
-
-        stream_response = client.send_message_streaming(streaming_request)
-
-        print('\nStreaming Response:')
-        async for chunk in stream_response:
-            print(chunk.model_dump(mode='json', exclude_none=True))
+        # Test 4: Streaming response (Same as Test 1 but explicitly showing streaming capability which is default now)
+        logger.info('\n=== Test 4: Streaming Freelancer Selection (Implicit) ===')
+        # Re-using message from Test 1
+        await print_responses(client.send_message(message))
 
 
 if __name__ == '__main__':
     import asyncio
-
     asyncio.run(main())
+

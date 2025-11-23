@@ -1,0 +1,122 @@
+# Project Decomposition Agent API Interface
+# Version: 1.0.0
+# Description: This YAML file defines the interface for interacting with the Project Decomposition Agent via the A2A protocol.
+#              It serves as both configuration documentation and a reference for constructing valid payloads.
+
+api_info:
+  title: "Project Decomposition Agent API"
+  description: "An agent that decomposes project descriptions into detailed phases and tasks, storing the results in Supabase and triggering an external orchestrator."
+  endpoint: "/a2a/v1/tasks"  # Standard A2A task endpoint
+  method: "POST"
+
+# ------------------------------------------------------------------------------
+# REQUEST PAYLOAD SCHEMA
+# ------------------------------------------------------------------------------
+# The top-level object sent to the agent executor.
+message:
+  description: "The core message object containing the user's request and associated metadata."
+  type: "object"
+  required: ["context_id", "message_id", "parts", "metadata"]
+  
+  fields:
+    context_id:
+      type: "string"
+      description: "A unique identifier for the conversation thread or session. Used to maintain state across multiple turns."
+      example: "thread-550e8400-e29b-41d4-a716-446655440000"
+      
+    message_id:
+      type: "string"
+      description: "A unique identifier for this specific message. Must be unique for every request."
+      example: "msg-12345678-1234-5678-1234-567812345678"
+      
+    parts:
+      type: "array"
+      description: "A list of content parts that make up the message body. Currently supports text parts."
+      items:
+        type: "object"
+        required: ["kind", "text"]
+        fields:
+          kind:
+            type: "string"
+            enum: ["text"]
+            description: "The type of content part. Must be 'text' for this agent."
+          text:
+            type: "string"
+            description: "The natural language query or project description to be decomposed."
+            example: "Break down a web application project for an e-commerce platform with a budget of $50k."
+            
+    metadata:
+      type: "object"
+      description: "Critical context required by the agent to process the request correctly."
+      required: ["project_id", "client_id"]
+      fields:
+        project_id:
+          type: "string"
+          description: "The UUID of the project in the database. Used to associate the decomposition with a specific project record."
+          example: "058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc"
+          
+        client_id:
+          type: "string"
+          description: "The UUID of the client or user requesting the decomposition. Used for authentication with the external orchestrator."
+          example: "9a76be62-0d44-4a34-913d-08dcac008de5"
+          
+        exist:
+          type: "boolean"
+          description: "Flag indicating if this is an update to an existing project (true) or a new decomposition (false). Defaults to false."
+          default: false
+          example: false
+
+# ------------------------------------------------------------------------------
+# RESPONSE STREAM SCHEMA
+# ------------------------------------------------------------------------------
+# The agent streams responses back as a series of events.
+response_stream:
+  description: "The agent returns a stream of status updates followed by a final result."
+  
+  events:
+    status_update:
+      description: "Intermediate updates on the agent's progress."
+      fields:
+        is_task_complete: 
+          type: "boolean"
+          value: false
+        require_user_input: 
+          type: "boolean"
+          value: false
+        content: 
+          type: "string"
+          examples:
+            - "Starting project decomposition..."
+            - "Information extracted from conversation."
+            - "Project requirements uploaded to database."
+            - "Decomposition process initiated."
+            
+    final_result:
+      description: "The final outcome of the decomposition process."
+      fields:
+        is_task_complete: 
+          type: "boolean"
+          value: true
+        require_user_input: 
+          type: "boolean"
+          description: "True if the process failed and needs user intervention, False otherwise."
+        content: 
+          type: "string"
+          examples:
+            - "Project decomposition completed successfully. Status: Started"
+            - "Project decomposition failed: Project ID missing"
+
+# ------------------------------------------------------------------------------
+# EXAMPLE COMPLETE PAYLOAD
+# ------------------------------------------------------------------------------
+example_payload:
+  message:
+    context_id: "thread-123"
+    message_id: "msg-456"
+    parts:
+      - kind: "text"
+        text: "Create a project plan for a mobile app that tracks daily water intake."
+    metadata:
+      project_id: "proj-789"
+      client_id: "user-abc"
+      exist: false

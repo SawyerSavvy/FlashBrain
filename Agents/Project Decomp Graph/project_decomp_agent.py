@@ -29,24 +29,6 @@ class ProjectDecompState(TypedDict):
     orchestrator_response: Optional[str] #Response from the A2A 
     job_status: Optional[str] #Status of the async job 
 
-
-
-project_decomp_skill = AgentSkill(
-    id='project_decomposition',
-    name="project_decomposition",
-    description="Decomposes a project into a set of phases and tasks.",
-    tags=["project", "decomposition"],
-)
-
-AgentCard(
-    name="Project Decomposition Agent",
-    description="An agent that decomposes projects into manageable tasks.",
-    url="http://localhost:8011",  # Required parameter
-    version="0.1.0",
-    capabilities={"streaming": False},
-    skills=[project_decomp_skill],
-)
-
 class ProjectDecompAgent:
 
     SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
@@ -60,24 +42,11 @@ class ProjectDecompAgent:
         workflow.add_node("extract_information", self.extract_information)
         workflow.add_node("upload_to_supabase", self.upload_to_supabase)
         workflow.add_node("call_orchestrator", self.call_orchestrator)
-        workflow.add_node("check_status", self.check_status)
-        workflow.add_node("wait_node", self.wait_node)
 
         workflow.add_edge(START, "extract_information")
         workflow.add_edge("extract_information", "upload_to_supabase")
         workflow.add_edge("upload_to_supabase", "call_orchestrator")
-        workflow.add_edge("call_orchestrator", "check_status")
-
-        workflow.add_conditional_edges(
-            "check_status",
-            self._check_status_condition,
-            {
-                END: END,
-                "wait_node": "wait_node"
-            }
-        )
-
-        workflow.add_edge("wait_node", "check_status")
+        workflow.add_edge("call_orchestrator", END)
 
         return workflow.compile()
 
@@ -211,56 +180,6 @@ class ProjectDecompAgent:
                 "orchestrator_response": f"Error: {e}"
             }
 
-    # --- Node 3: Check Job Status ---
-    def check_status(self, state: ProjectDecompState) -> Dict[str, Any]:
-        """
-        Checks the status of the project decomposition job.
-        """
-        project_id = state.get("project_id")
-        orchestrator_url = os.getenv("PROJECT_DECOMP_ORCHESTRATOR_URL", "")
-        
-        if not orchestrator_url.endswith("/project"):
-            base_url = orchestrator_url.rstrip('/')
-        else:
-            base_url = orchestrator_url.replace("/project", "")
-            
-        status_url = f"{orchestrator_url.rstrip('/')}/project/{project_id}/status"
-        
-        import requests
-        try:
-            headers = {"x-api-key": state.get("client_id")}
-            response = requests.get(status_url, headers=headers)
-            
-            if response.status_code == 200:
-                data = response.json()
-                status = data.get("status", "unknown")
-                return {"job_status": status}
-            else:
-                print(f"Status check failed: {response.status_code}")
-                return {"job_status": "failed"}
-                
-        except Exception as e:
-            print(f"Status check error: {e}")
-            return {"job_status": "failed"}
-
-    # --- Node 4: Wait ---
-    def wait_node(self, state: ProjectDecompState) -> Dict[str, Any]:
-        """
-        Waits for a few seconds before checking status again.
-        """
-        import time
-        time.sleep(10)
-        return {}
-
-    def _check_status_condition(self, state: ProjectDecompState) -> str:
-        status = state.get("job_status", "unknown")
-        if status == "completed":
-            return END
-        elif status == "failed":
-            return END
-        else:
-            return "wait_node"
-
     async def stream(self, query: str, context_id: str = "default", project_id: str = None, client_id: str = None, exist: bool = False):
         """
         Streams responses from the Project Decomposition Graph for A2A protocol.
@@ -271,7 +190,6 @@ class ProjectDecompAgent:
                 - require_user_input: bool
                 - content: str
         """
-        print("Streaming...")
         messages = [HumanMessage(content=query)]
         inputs = {
             "messages": messages,
@@ -293,14 +211,30 @@ class ProjectDecompAgent:
             # Execute the graph with streaming
             final_state = {}
             for event in self.graph.stream(inputs, stream_mode = 'messages', subgraphs= True):
-                print(event)
+                message = event[1]
+                #print(event[1][1]['langgraph_node'])
                 
-
+                if isinstance(message[0], SystemMessage):
+                    yield {
+                        'is_task_complete': False,
+                        'require_user_input': False,
+                        'content': "Writing to Database..."
+                    }
+                elif isinstance(message[0], AIMessage) and message[1]['langgraph_node'] == 'call_orchestrator':
+                    yield {
+                        'is_task_complete': False,
+                        'require_user_input': False,
+                        'content': "Creating Project Plan... This may take a few minutes."
+                    }
+                
+                        
+                
             # Final result processing
             job_status = final_state.get("job_status", "unknown")
             orchestrator_response = final_state.get("orchestrator_response", "")
 
             # Check if we need user input based on status
+            '''
             if job_status == "failed":
                 yield {
                     'is_task_complete': False,
@@ -319,6 +253,7 @@ class ProjectDecompAgent:
                     'require_user_input': False,
                     'content': f"Project decomposition job status: {job_status}. Response: {orchestrator_response}"
                 }
+            '''
 
         except Exception as e:
             yield {

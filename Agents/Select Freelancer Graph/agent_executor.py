@@ -47,19 +47,22 @@ class SelectFreelancerAgentExecutor(AgentExecutor):
         updater = TaskUpdater(event_queue, task.id, task.context_id)
 
         try:
-            # Extract project_id from message metadata if available
+            # Extract additional parameters from message metadata if available
             project_id = None
+            client_id = None
 
             if hasattr(context, 'message') and context.message:
                 metadata = getattr(context.message, 'metadata', None)
                 if metadata:
                     project_id = metadata.get('project_id')
+                    client_id = metadata.get('client_id')
 
             # Stream responses from the agent
             async for item in self.agent.stream(
                 query,
                 context_id=task.context_id,
-                project_id=project_id
+                project_id=project_id,
+                client_id=client_id
             ):
                 is_task_complete = item.get('is_task_complete', False)
                 require_user_input = item.get('require_user_input', False)
