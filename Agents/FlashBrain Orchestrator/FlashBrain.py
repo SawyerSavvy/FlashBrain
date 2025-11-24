@@ -1,8 +1,8 @@
 from typing import Annotated, List, Literal, Optional, TypedDict, Union, Dict, Any
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-
-load_dotenv()
+import os
+import logging
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
@@ -12,18 +12,17 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.prompts import ChatPromptTemplate
+import asyncio
 
 from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT
 # --- A2A Integration ---
-from python_a2a import run_server, AgentCard, AgentSkill
+from python_a2a import run_server
 from a2a_client_helper import call_project_decomp_agent, call_freelancer_agent, call_summarization_agent
-import matplotlib.pyplot as plt
 
+load_dotenv()
 
-
-import os
-import logging
 logger = logging.getLogger(__name__)
+
 # --- 1. State Definitions ---
 
 class ReasoningMetadata(BaseModel):
@@ -42,20 +41,20 @@ class AgentResponse(BaseModel):
 class GatewayRouterOutput(BaseModel):
     """Schema for the gateway router's output."""
     model_type: Literal["fast_model", "powerful_model"] = Field(..., description="The type of model to use for the next step.")
-    next_step_category: Literal["responder", "orchestrator"] = Field(..., description="The category of the next step to take.")
+    next_step_category: Literal["orchestrator"] = Field(..., description="The category of the next step to take.")
 
 class OrchestratorOutput(BaseModel):
     """Schema for the orchestrator's output."""
     next_step_route: Literal["planning_agent", "team_selection_agent", "finops_agent", "answer_directly"] = Field(..., description="The next agent to route to.")
     response: Optional[str] = Field(None, description="The direct response to the user, if applicable.")
-
+    
 class BrainState(TypedDict):
     """Core state for the FlashBrain system."""
     # Message history (Router adds messages to a list)
     messages: Annotated[List[BaseMessage], add_messages]
     
     # Context
-    user_id: Optional[str]  # user_id is used for authentication and authorization
+    client_id: Optional[str]  # client_id is used for authentication and authorization
     project_id: Optional[str]  # project_id is the current project that the user is working on 
     
     # Internal routing state
@@ -72,6 +71,12 @@ class BrainState(TypedDict):
     # Token usage from the last model run
     last_token_usage: Optional[int]
 
+    # Short conversation history for the last 10 messages
+    short_conversation_history: Optional[List[BaseMessage]]
+
+    # UI messages
+    ui_messages: Optional[List[BaseMessage]]
+    
 class GeminiModel:
     def __init__(self, model_name: str, temperature: float = 0.0):
         self.model_name = model_name
@@ -93,416 +98,529 @@ class GeminiModel:
             print(f"Error calling {self.model_name}: {e}")
             raise
 
-# --- 3. Shared Resources (LLM) ---
-# Initialize LLM clients once at module level to avoid re-init overhead.
-# This centralizes model management and allows easy routing.
-MODEL_CLIENTS: Dict[str, GeminiModel] = {}
-try:
-    MODEL_CLIENTS["routing"] = GeminiModel(model_name="gemini-2.5-flash-lite", temperature=0.0) # For gateway routing
-    MODEL_CLIENTS["fast"] = GeminiModel(model_name="gemini-2.5-flash", temperature=0.0) # For basic tasks
-    MODEL_CLIENTS["powerful"] = GeminiModel(model_name="gemini-3-pro-preview", temperature=0.1) # For complex orchestrator tasks
-    print("All Gemini LLM clients initialized.")
-except Exception as e:
-    print(f"Error initializing one or more Gemini LLM clients: {e}. Some functionalities might be degraded.")
-
-# --- 4. Nodes & Agents ---
-
-# --- Level 0: Intelligent Gateway ---
-def gateway_router(state: BrainState) -> Dict[str, Any]:
-    """
-    Lightweight classifier to route between simple Workflow and complex Orchestrator,
-    and to select the appropriate model (fast or powerful) for subsequent steps.
-    """
-    last_msg_content = state["messages"][-1].content
-    logger.info(f"DEBUG: gateway_router last_msg_content type: {type(last_msg_content)}, value: {last_msg_content}")
-
-    # Default to fast model and orchestrator if routing model is not available
-    model_choice = "fast"
-    next_step_category = "orchestrator"
-    token_usage = 0
-
-    routing_model_client = MODEL_CLIENTS.get("routing")
-
-    if routing_model_client:
-        try:
-
-            # Use .with_structured_output for reliable JSON parsing
-            agent = routing_model_client.client.with_structured_output(GatewayRouterOutput)
-
-            #Invoke agent with the system prompt and the user's message
-            messages = [
-                {"role": "system", "content": GATEWAY_ROUTER_PROMPT},
-                {"role": "user", "content": last_msg_content}
-            ]
-            response = agent.invoke(messages)
-
-            # Parse the response
-            model_choice = response.model_type.replace("_model", "") # Convert to "fast" or "powerful"
-            next_step_category = response.next_step_category
-            
-            # Calculate token usage (approximate since structured output hides metadata)
-            # We reconstruct the messages to count tokens
-            if hasattr(routing_model_client.client, "get_num_tokens_from_messages"):
-                # Convert dict messages to BaseMessage for counting
-                msgs_for_count = [SystemMessage(content=GATEWAY_ROUTER_PROMPT), HumanMessage(content=last_msg_content)]
-                input_tokens = routing_model_client.client.get_num_tokens_from_messages(msgs_for_count)
-                # Estimate output tokens from the Pydantic model (approx)
-                output_tokens = len(str(response.model_dump())) // 4
-                token_usage = input_tokens + output_tokens
-
-            # Update the BrainState 
-            return {
-                "next_step": next_step_category,
-                "previous_step": "gateway",
-                "selected_model_key": model_choice,
-                "last_token_usage": token_usage
-            }
-
-        except Exception as e:
-            logger.error(f"FlashBrain:Gateway routing LLM execution failed ({e}), falling back to heuristic.")
-    
-    # Fallback heuristic for model choice (if routing model fails or is unavailable)
-    if any(x in last_msg_content for x in ["plan", "analyze", "complex", "deep dive"]):
-        model_choice = "powerful"
-    else:
-        model_choice = "fast" # Default to fast for basic tasks
-
-    # Fallback heuristic for next step category (if routing model fails or is unavailable)
-    if any(x in last_msg_content for x in ["mark", "create event", "update status"]):
-        next_step_category = "responder"
-    else:
-        next_step_category = "orchestrator"
-
-    return {
-        "next_step": next_step_category,
-        "previous_step": "gateway",
-        "selected_model_key": model_choice,
-        "last_token_usage": 0
-    }
-
-    # --- Level 1: FlashBrain Orchestrator ---
-def orchestrator_node(state: BrainState) -> Dict[str, Any]:
-    """
-    The central brain. Decides which reasoning subsystem to call or answers the user,
-    using the appropriate LLM based on the selected_model_key.
-    """
-
-    # Get the last message content
-    last_msg_content = state["messages"][-1].content
-    print(f"FlashBrain:orchestrator_node last_msg_content type: {type(last_msg_content)}, value: {last_msg_content}")
-
-    # Use the selected model key to get the appropriate model client
-    selected_model_key = state.get("selected_model_key", "powerful") # Orchestrator defaults to powerful
-    orchestrator_model = MODEL_CLIENTS.get(selected_model_key)
-    token_usage = 0
-
-    if orchestrator_model:
-        try:
-            # Use .with_structured_output for reliable JSON parsing
-            agent = orchestrator_model.client.with_structured_output(OrchestratorOutput)
-
-            # Invoke agent
-            messages = [
-                {"role": "system", "content": ORCHESTRATOR_PROMPT},
-                {"role": "user", "content": last_msg_content}
-            ]
-            response = agent.invoke(messages)
-
-            # Parse the response
-            next_step_route = response.next_step_route
-            
-            # Calculate token usage
-            if hasattr(orchestrator_model.client, "get_num_tokens_from_messages"):
-                msgs_for_count = [SystemMessage(content=ORCHESTRATOR_PROMPT), HumanMessage(content=last_msg_content)]
-                input_tokens = orchestrator_model.client.get_num_tokens_from_messages(msgs_for_count)
-                output_tokens = len(str(response.model_dump())) // 4
-                token_usage = input_tokens + output_tokens
-
-            # If the next step is to answer directly, return the response, else return the next step
-            if next_step_route == "answer_directly":
-                return {
-                    "next_step": END,
-                    "messages": [AIMessage(content=response.response or "I have processed your request.")],
-                    "last_token_usage": token_usage
-                }
-            else:
-                return {
-                    "next_step": next_step_route,
-                    "last_token_usage": token_usage
-                }
-
-        except Exception as e:
-            print(f"Orchestrator LLM execution failed ({e}), falling back to heuristic. Error: {e}")
-
-    # Fallback heuristic (if LLM fails or is unavailable)
-    if "plan" in last_msg_content or "decompose" in last_msg_content:
-        return {"next_step": "planning_agent"}
-    elif "team" in last_msg_content or "hire" in last_msg_content:
-        return {"next_step": "team_selection_agent"}
-    elif "budget" in last_msg_content or "cost" in last_msg_content:
-        return {"next_step": "finops_agent"}
-    else:
-        return {
-            "next_step": END,
-            "messages": [AIMessage(content="Error in orchestrator node. Please try again.")],
-            "last_token_usage": 0
-        }
-    
-
-def response_agent_node(state: BrainState) -> Dict[str, Any]:
-    """
-    Answers the user's query directly.
-    """
-    # Get the last message content
-    last_msg_content = state["messages"][-1].content 
-
-    # Use the selected model key to get the appropriate model client
-    selected_model_key = state.get("selected_model_key", "fast") # Response agent defaults to powerful
-    response_model = MODEL_CLIENTS.get(selected_model_key)
-    token_usage = 0
-
-    if response_model:
-        try:
-            # Invoke agent
-            response = response_model.client.invoke([
-                {"role": "system", "content": RESPONSE_AGENT_PROMPT},
-                {"role": "user", "content": last_msg_content}
-            ])
-            
-            # Extract token usage from metadata
-            if response.usage_metadata:
-                token_usage = response.usage_metadata.get("total_tokens", 0)
-
-        except Exception as e:
-            print(f"Response agent LLM execution failed ({e}), falling back to heuristic. Error: {e}")
-            response = AIMessage(content="I'm sorry, I encountered an error.")
-            
-    return {
-        "messages": [AIMessage(content=response.content)],
-        "next_step": END,
-        "last_token_usage": token_usage
-    }
-
-# --- Level 2: Reasoning Subsystems ---
-
-# 2a. Planning Agent (Async Job Pattern)
-def planning_agent_node(state: BrainState) -> Dict[str, Any]:
-    """
-    Calls the external Planning Agent via A2A protocol HTTP endpoint.
-    """
-    last_msg_content = state["messages"][-1].content
-    agent_url = os.getenv("PROJECT_DECOMP_AGENT_URL", "http://localhost:8011")
-
-    # Use helper function to call agent
-    response_text = call_project_decomp_agent(
-        agent_url=agent_url,
-        message=last_msg_content,
-        project_id=state.get("project_id"),
-        client_id=state.get("user_id"),
-        exist=False,
-        context_id=state.get("user_id", "default")
-    )
-
-    return {
-        "messages": [AIMessage(content=response_text)],
-        "next_step": END
-    }
-
-# 2b. Team Selection Agent (Reasoning Sidecar)
-def team_selection_node(state: BrainState) -> Dict[str, Any]:
-    """
-    Calls the external Select Freelancer Agent via A2A protocol HTTP endpoint.
-    """
-    last_msg_content = state["messages"][-1].content
-    agent_url = os.getenv("SELECT_FREELANCER_AGENT_URL", "http://localhost:8012")
-
-    # Use helper function to call agent
-    response_text = call_freelancer_agent(
-        agent_url=agent_url,
-        message=last_msg_content,
-        project_id=state.get("project_id"),
-        context_id=state.get("user_id", "default")
-    )
-
-    # Create AgentResponse object for metadata
-    agent_response = AgentResponse(
-        status="success",
-        data={"response": response_text},
-        metadata=ReasoningMetadata(
-            reasoning="Called external freelancer selection agent via A2A.",
-            confidence_score=1.0
-        )
-    )
-
-    return {
-        "messages": [AIMessage(content=response_text)],
-        "last_agent_response": agent_response.model_dump(),
-        "next_step": END
-    }
-
-# 2c. FinOps Agent (Code Sandbox)  # TODO: Not sure what to do here yet, need to discuss with Nisi. 
-def finops_node(state: BrainState) -> Dict[str, Any]:
-    """
-    Executes Python/SQL for math. Never uses raw LLM for calculation.
-    """
-    # Simulation: Run python calculation
-    budget = 50000
-    burn_rate = 5000
-    runway = budget / burn_rate
-    
-    response = AgentResponse(
-        status="success",
-        data={"forecast_months": runway, "burn_rate": burn_rate},
-        metadata=ReasoningMetadata(
-            reasoning="Calculated based on current monthly burn rate from DB.",
-            confidence_score=1.0
-        )
-    )
-    
-    msg = f"Based on the data, you have {runway} months of runway left."
-    return {
-        "messages": [AIMessage(content=msg)],
-        "last_agent_response": response.model_dump(),
-        "next_step": END
-    }
-
-
-# --- Level 3: Deterministic Workflow Node --- #TODO: Simple Supabase tools
-def basic_tools_node(state: BrainState) -> Dict[str, Any]:
-    """
-    Executes simple deterministic actions via tools.
-    """
-    # In a real graph, this would call ToolNode(WORKFLOW_TOOLS)
-    # Here we simulate a successful tool call.
-    return {
-        "messages": [AIMessage(content="Executed workflow action successfully.")],
-        "next_step": END
-    }
-
-# --- Summarization Node ---
-def summarize_conversation(state: BrainState) -> Dict[str, Any]:
-    """
-    Summarizes the conversation if the PREVIOUS model run exceeded a token limit.
-    Calls the external Summarization Agent via A2A HTTP endpoint.
-    """
-    messages = state["messages"]
-    last_token_usage = state.get("last_token_usage", 0)
-
-    # Threshold for summarization (e.g., > 20000 tokens in the last run)
-    if last_token_usage > 20000:
-        # Keep the last 2 messages (user's latest input + potential system context)
-        messages_to_summarize = messages[:-2]
-
-        if not messages_to_summarize:
-            return {}
-
-        # Get agent URL from environment
-        agent_url = os.getenv("SUMMARIZATION_AGENT_URL", "http://localhost:8013")
-
-        # Serialize messages to dicts
-        serialized_messages = []
-        for m in messages:
-            serialized_messages.append({
-                "role": m.type,
-                "content": m.content,
-                "id": m.id if hasattr(m, "id") else None
-            })
-
-        # Call summarization agent using helper
-        result = call_summarization_agent(
-            agent_url=agent_url,
-            messages=serialized_messages,
-            keep_last=2,
-            context_id=state.get("user_id", "default")
-        )
-
-        if result:
-            print(f"Summarization completed: {result}")
-
-            # Create a summary message placeholder
-            summary_message = SystemMessage(content="[Previous conversation summarized]")
-
-            # Remove old messages and add summary
-            messages_to_remove = messages[:-2]
-            delete_messages = [RemoveMessage(id=m.id) for m in messages_to_remove if hasattr(m, 'id')]
-
-            return {"messages": [summary_message] + delete_messages}
-
-    return {}
-
-# --- 5. Graph Construction --- 
-def build_flashbrain_graph(): 
-    workflow = StateGraph(BrainState) 
-
-    # Add Nodes
-    workflow.add_node("summarize_conversation", summarize_conversation)
-    workflow.add_node("gateway", gateway_router)
-    workflow.add_node("orchestrator", orchestrator_node)
-    
-    # Use the A2A wrapper node
-    workflow.add_node("planning_agent", planning_agent_node)
-    
-    workflow.add_node("team_selection_agent", team_selection_node)
-    workflow.add_node("finops_agent", finops_node)
-    workflow.add_node("responder", response_agent_node)
-
-    # Set Entry Point
-    workflow.add_edge(START, "summarize_conversation")
-    workflow.add_edge("summarize_conversation", "gateway")
-
-    # Edges from Gateway
-    workflow.add_conditional_edges(
-        "gateway",
-        lambda x: x["next_step"],
-        {
-            "orchestrator": "orchestrator",
-            "responder": "responder"
-        }
-    )
-
-    # Edges from Orchestrator
-    workflow.add_conditional_edges(
-        "orchestrator",
-        lambda x: x["next_step"],
-        {
-            "planning_agent": "planning_agent",
-            "team_selection_agent": "team_selection_agent",
-            "finops_agent": "finops_agent",
-            END: END
-        }
-    )
-
-    # Edges from Sub-Agents (return to END for now, could loop back to Orchestrator)
-    workflow.add_edge("planning_agent", END)
-    workflow.add_edge("team_selection_agent", END)
-    workflow.add_edge("finops_agent", END)
-    workflow.add_edge("responder", END)
-
-    # Add Checkpointer for Memory
-    memory = MemorySaver()
-    return workflow.compile(checkpointer=memory)
-
-flashbrain_skill = AgentSkill(
-    id='flashbrain_orchestrator',
-    name="flashbrain_orchestrator",
-    description="Orchestrates the entire FlashBrain system.",
-    tags=["orchestrator", "brain"],
-)
-
-AgentCard(
-    name="FlashBrain Orchestrator",
-    description="The central orchestrator for the FlashBrain system.",
-    url="http://localhost:8010",  # Required parameter
-    version="0.1.0",
-    capabilities={"streaming": True},
-    skills=[flashbrain_skill],
-)
-
 class FlashBrainAgent:
 
-    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
+    SUPPORTED_CONTENT_TYPES = [
+        # Currently implemented:
+        'text',
+        'text/plain',
+        'application/json',  # Used for structured A2A agent communication
+        
+        # TODO: Requires document parsing implementation:
+        'application/pdf',  # PDF documents - needs PDF extraction
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx - needs docx parsing
+        'text/markdown',  # Markdown files - needs markdown handling
+        
+        # TODO: Requires multimodal handling implementation:
+        'image/jpeg',  # Images - needs Gemini multimodal API integration
+        'image/png',
+        'image/webp',
+    ]
 
-    async def stream(self, query: str, session_id: str = "default", user_id: str = None, project_id: str = None):
+    def __init__(self):
+        print("FlashBrainAgent initialized")
+        # Initialize LLM clients
+        self.model_clients: Dict[str, GeminiModel] = {}
+        try:
+            self.model_clients["routing"] = GeminiModel(model_name="gemini-2.5-flash-lite", temperature=0.0) # For gateway routing
+            self.model_clients["fast"] = GeminiModel(model_name="gemini-2.5-flash", temperature=0.0) # For basic tasks
+            self.model_clients["powerful"] = GeminiModel(model_name="gemini-2.5-pro", temperature=0.1) # For complex orchestrator tasks
+            print("All Gemini LLM clients initialized.")
+        except Exception as e:
+            print(f"Error initializing one or more Gemini LLM clients: {e}. Some functionalities might be degraded.")
+        
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        workflow = StateGraph(BrainState) 
+
+        # Add Nodes
+        workflow.add_node("summarize_conversation", self.summarize_conversation)
+        workflow.add_node("gateway", self.gateway_router)
+        workflow.add_node("orchestrator", self.orchestrator_node)
+        
+        # Use the A2A wrapper node
+        workflow.add_node("planning_agent", self.planning_agent_node)
+        
+        workflow.add_node("team_selection_agent", self.team_selection_node)
+        workflow.add_node("finops_agent", self.finops_node)
+        workflow.add_node("responder", self.response_agent_node)
+
+        # Set Entry Point
+        workflow.add_edge(START, "summarize_conversation")
+        workflow.add_edge("summarize_conversation", "gateway")
+
+        # Edges from Gateway
+        # 3. Define Conditional Edges
+        def route_from_gateway(state: BrainState) -> str:
+            """Route from gateway based on next_step."""
+            next_step = state.get("next_step", "orchestrator")
+            
+            # Map routing decisions to actual node names
+            routing_map = {
+                "orchestrator": "orchestrator",
+                "answer_directly": "responder",  # Direct answers go to responder
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+            }
+            
+            return routing_map.get(next_step, "orchestrator")  # Default to orchestrator if unknown
+
+        def route_from_orchestrator(state: BrainState) -> str:
+            """Route from orchestrator based on next_step."""
+            next_step = state.get("next_step", END)
+            
+            # Map orchestrator decisions to actual node names  
+            routing_map = {
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+                "finops_agent": "finops_agent",
+                "answer_directly": "responder", # Orchestrator can also decide to answer directly
+            }
+            
+            return routing_map.get(next_step, END)  # If next_step is END or unknown, return END
+
+        workflow.add_conditional_edges(
+            "gateway",
+            route_from_gateway,
+            {
+                "orchestrator": "orchestrator",
+                "responder": "responder",
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+            }
+        )
+
+        # Edges from Orchestrator
+        workflow.add_conditional_edges(
+            "orchestrator",
+            route_from_orchestrator,
+            {
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+                "finops_agent": "finops_agent",
+                "responder": "responder", # Orchestrator can also decide to answer directly
+                END: END
+            }
+        )
+
+        # Edges from Sub-Agents (return to END for now, could loop back to Orchestrator)
+        workflow.add_edge("planning_agent", END)
+        workflow.add_edge("team_selection_agent", END)
+        workflow.add_edge("finops_agent", END)
+        workflow.add_edge("responder", END)
+
+        # Add Checkpointer for Memory
+        memory = MemorySaver()
+        return workflow.compile(checkpointer=memory)
+
+    # --- Level 1: Gateway ---
+    
+    def filter_meaningful_messages(self, messages: List[BaseMessage], max_count: int = 10) -> List[BaseMessage]:
+        """
+        Filter messages to keep only meaningful conversation.
+        Excludes:
+        - SystemMessages
+        - Short AI placeholder messages (e.g., "Processing Conversation...", "Processing: xxx...")
+        
+        Returns the last max_count meaningful messages.
+        """
+        meaningful = []
+        
+        for msg in messages:
+            # Skip system messages
+            if isinstance(msg, SystemMessage):
+                continue
+            
+            meaningful.append(msg)
+        
+        # Return the last max_count messages
+        return meaningful[-max_count:] if len(meaningful) > max_count else meaningful
+
+    def gateway_router(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Lightweight classifier to route between simple Workflow and complex Orchestrator,
+        and to select the appropriate model (fast or powerful) for subsequent steps.
+        """
+        messages = state["messages"]
+        
+        # Filter to get only meaningful messages (last 10, excluding system and placeholders)
+        recent_messages = self.filter_meaningful_messages(messages, max_count=10)
+        
+        # Default to fast model and orchestrator if routing model is not available
+        model_choice = "fast"
+        next_step_category = "orchestrator"
+        token_usage = 0
+
+        routing_model_client = self.model_clients.get("routing")
+
+        if routing_model_client and messages:
+            try:
+                # Use .with_structured_output for reliable JSON parsing
+                agent = routing_model_client.client.with_structured_output(GatewayRouterOutput)
+
+                # Convert state messages to LLM format, sending full conversation history
+                llm_messages = [{"role": "system", "content": GATEWAY_ROUTER_PROMPT}]
+            
+                for msg in recent_messages:
+                    if isinstance(msg, HumanMessage):
+                        llm_messages.append({"role": "user", "content": msg.content})
+                    elif isinstance(msg, AIMessage):
+                        llm_messages.append({"role": "assistant", "content": msg.content})
+                
+                response = agent.invoke(llm_messages) #TODO: streaming for LLMs
+
+                # Parse the response
+                model_choice = response.model_type.replace("_model", "")  # Convert to "fast" or "powerful"
+                next_step_category = response.next_step_category
+                
+                # Calculate token usage (approximate since structured output hides metadata)
+                if hasattr(routing_model_client.client, "get_num_tokens_from_messages"):
+                    # Convert dict messages to BaseMessage for counting
+                    msgs_for_count = [SystemMessage(content=GATEWAY_ROUTER_PROMPT)] + list(recent_messages)
+                    input_tokens = routing_model_client.client.get_num_tokens_from_messages(msgs_for_count)
+                    # Estimate output tokens from the Pydantic model (approx)
+                    output_tokens = len(str(response.model_dump())) // 4
+                    token_usage = input_tokens + output_tokens
+
+                # Update the BrainState 
+                return {
+                    "next_step": next_step_category,
+                    "previous_step": "gateway",
+                    "selected_model_key": model_choice,
+                    "last_token_usage": token_usage,
+                    "short_conversation_history": recent_messages,  # Save filtered messages
+                    "ui_messages": [AIMessage(content="🎯 Routing your request...")]
+                }
+
+            except Exception as e:
+                logger.error(f"FlashBrain:Gateway routing LLM execution failed ({e}), falling back to heuristic.")
+        
+        return {
+            "next_step": END,
+            "previous_step": "gateway",
+            "last_token_usage": 0
+        }
+
+    # --- Level 1: FlashBrain Orchestrator ---
+    def orchestrator_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        The central brain. Decides which reasoning subsystem to call or answers the user,
+        Multi-step orchestrator that coordinates between different specialist agents.
+        """
+
+        # Use pre-filtered messages from gateway if available, otherwise filter now
+        recent_messages = state.get("short_conversation_history")
+        if not recent_messages:
+            messages = state["messages"]
+            recent_messages = self.filter_meaningful_messages(messages, max_count=10)
+    
+        # Use the selected model key to get the appropriate model client
+        selected_model_key = state.get("selected_model_key", "powerful") # Orchestrator defaults to powerful
+        orchestrator_model = self.model_clients.get(selected_model_key)
+
+        if orchestrator_model:
+            try:
+                # Use .with_structured_output for reliable JSON parsing
+                agent = orchestrator_model.client.with_structured_output(OrchestratorOutput)
+
+                # Build message list with system prompt and conversation history
+                llm_messages = [{"role": "system", "content": ORCHESTRATOR_PROMPT}]
+                
+                # Add recent conversation history
+                for msg in recent_messages:
+                    if isinstance(msg, HumanMessage):
+                        llm_messages.append({"role": "user", "content": msg.content})
+                    elif isinstance(msg, AIMessage):
+                        llm_messages.append({"role": "assistant", "content": msg.content})
+
+                response = agent.invoke(llm_messages)
+
+                # Parse the response - use correct attribute name from OrchestratorOutput
+                next_step = response.next_step_route
+
+                # Calculate token usage
+                if hasattr(orchestrator_model.client, "get_num_tokens_from_messages"):
+                    msgs_for_count = [SystemMessage(content=ORCHESTRATOR_PROMPT)] + list(recent_messages)
+                    input_tokens = orchestrator_model.client.get_num_tokens_from_messages(msgs_for_count)
+                    output_tokens = len(str(response.model_dump())) // 4
+                    token_usage = input_tokens + output_tokens
+                else:
+                    token_usage = 0
+
+                return {
+                    "next_step": next_step,
+                    "last_token_usage": token_usage,
+                    "previous_step": "orchestrator",
+                    "ui_messages": [AIMessage(content="🧠 Determining next step...")]
+                }
+
+            except Exception as e:
+                print(f"Orchestrator LLM execution failed ({e}), falling back to heuristic. Error: {e}")
+
+        # Fallback heuristic (if LLM fails or is unavailable)
+        return {
+            "next_step": END,
+            "messages": [AIMessage(content="Error. Please try again.")],
+            "last_token_usage": 0,
+            "previous_step": "orchestrator"
+        }
+        
+    def response_agent_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Answers the user's query directly with streaming output.
+        LangGraph's messages mode will automatically stream LLM tokens.
+        """
+        # Use pre-filtered messages from gateway if available
+        recent_messages = state.get("short_conversation_history")
+        if not recent_messages:
+            messages = state["messages"]
+            recent_messages = self.filter_meaningful_messages(messages, max_count=10)
+
+        # Use the selected model key to get the appropriate model client
+        selected_model_key = state.get("selected_model_key", "fast")
+        response_model = self.model_clients.get(selected_model_key)
+
+        if response_model:
+            try:
+                # Build message list with conversation history
+                llm_messages = [{"role": "system", "content": RESPONSE_AGENT_PROMPT}]
+                
+                for msg in recent_messages:
+                    if isinstance(msg, HumanMessage):
+                        llm_messages.append({"role": "user", "content": msg.content})
+                    elif isinstance(msg, AIMessage):
+                        llm_messages.append({"role": "assistant", "content": msg.content})
+                
+                # Use .stream() - LangGraph will capture and emit these tokens in messages mode
+                full_response = ""
+                for chunk in response_model.client.stream(llm_messages):
+                    if hasattr(chunk, 'content') and chunk.content:
+                        full_response += chunk.content
+
+                # Return the complete response in messages
+                return {
+                    "messages": [AIMessage(content=full_response)],
+                    "next_step": END,
+                    "previous_step": "response_agent"
+                }
+
+            except Exception as e:
+                logger.error(f"Response agent LLM execution failed ({e}), falling back to error message.")
+                error_msg = AIMessage(content="I'm sorry, I encountered an error. Please try again.")
+                return {
+                    "messages": [error_msg],
+                    "next_step": END,
+                    "previous_step": "response_agent"
+                }
+        
+        # Fallback if no model available
+        error_msg = AIMessage(content="Response model not available.")
+        return {
+            "messages": [error_msg],
+            "next_step": END,
+            "previous_step": "response_agent"
+        }
+
+    # --- Level 2: Reasoning Subsystems ---
+
+    # 2a. Planning Agent (Async Job Pattern)
+    async def planning_agent_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Calls the external Planning Agent via A2A protocol HTTP endpoint.
+        Collects all streaming updates and returns them together.
+        
+        Note: This collects messages because LangGraph's stream_mode='updates' 
+        doesn't capture intermediate yields from generator nodes.
+        """
+        last_msg_content = state["messages"][-1].content
+        agent_url = os.getenv("PROJECT_DECOMP_AGENT_URL", "http://localhost:8011")
+
+        # Collect all streaming updates from the A2A agent
+        all_updates = []
+        all_updates.append("🔄 Processing with Planning Agent...")
+        
+        async for response_text in call_project_decomp_agent(
+            agent_url=agent_url,
+            message=last_msg_content,
+            project_id=state.get("project_id"),
+            client_id=state.get("client_id"),
+            exist=False,
+            context_id=state.get("client_id", "default")
+        ):
+            all_updates.append(response_text)
+            final_response = response_text
+
+        # Return all updates as a single message
+        combined_message = "\n".join(all_updates)
+        return {
+            "messages": [AIMessage(content=combined_message)],
+            "next_step": END
+        }
+
+    # 2b. Team Selection Agent (Reasoning Sidecar)
+    async def team_selection_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Calls the external Select Freelancer Agent via A2A protocol HTTP endpoint.
+        Collects all streaming updates and returns them together.
+        
+        Note: This collects messages because LangGraph's stream_mode='updates' 
+        doesn't capture intermediate yields from generator nodes.
+        """
+        last_msg_content = state["messages"][-1].content
+        agent_url = os.getenv("SELECT_FREELANCER_AGENT_URL", "http://localhost:8012")
+
+        # Collect all streaming updates from the A2A agent
+        all_updates = []
+        all_updates.append("🔍 Searching for freelancers...")
+        
+        async for response_text in call_freelancer_agent(
+            agent_url=agent_url,
+            message=last_msg_content,
+            project_id=state.get("project_id"),
+            client_id=state.get("client_id", "default")
+        ):
+            all_updates.append(response_text)
+            final_response = response_text
+
+        # Create AgentResponse object for metadata
+        agent_response = AgentResponse(
+            status="success",
+            data={"response": final_response},
+            metadata=ReasoningMetadata(
+                reasoning="Called external freelancer selection agent via A2A.",
+                confidence_score=1.0
+            )
+        )
+
+        # Return all updates as a single message
+        combined_message = "\n".join(all_updates)
+        return {
+            "messages": [AIMessage(content=combined_message)],
+            "last_agent_response": agent_response.model_dump(),
+            "next_step": END
+        }
+
+    # 2c. FinOps Agent (Code Sandbox)  # TODO: Not sure what to do here yet, need to discuss with Nisi. 
+    def finops_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Executes Python/SQL for math. Never uses raw LLM for calculation.
+        """
+        # Simulation: Run python calculation
+        budget = 50000
+        burn_rate = 5000
+        runway = budget / burn_rate
+        
+        response = AgentResponse(
+            status="success",
+            data={"forecast_months": runway, "burn_rate": burn_rate},
+            metadata=ReasoningMetadata(
+                reasoning="Calculated based on current monthly burn rate from DB.",
+                confidence_score=1.0
+            )
+        )
+        
+        msg = f"Based on the data, you have {runway} months of runway left."
+        return {
+            "messages": [AIMessage(content=msg)],
+            "last_agent_response": response.model_dump(),
+            "next_step": END
+        }
+
+
+    # --- Level 3: Deterministic Workflow Node --- #TODO: Simple Supabase tools
+    def basic_tools_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Executes simple deterministic actions via tools.
+        """
+        # In a real graph, this would call ToolNode(WORKFLOW_TOOLS)
+        # Here we simulate a successful tool call.
+        return {
+            "messages": [AIMessage(content="Executed workflow action successfully.")],
+            "next_step": END
+        }
+
+    # --- Summarization Node ---
+    def summarize_conversation(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Summarizes the conversation if the PREVIOUS model run exceeded a token limit.
+        Calls the external Summarization Agent via A2A HTTP endpoint.
+        """
+        messages = state["messages"]
+        last_token_usage = state.get("last_token_usage", 0)
+
+        # Threshold for summarization (e.g., > 20000 tokens in the last run)
+        if last_token_usage > 20000:
+            # Keep the last 2 messages (user's latest input + potential system context)
+            messages_to_summarize = messages[:-2]
+
+            if not messages_to_summarize:
+                return {}
+
+            # Get agent URL from environment
+            agent_url = os.getenv("SUMMARIZATION_AGENT_URL", "http://localhost:8013")
+
+            # Serialize messages to dicts
+            serialized_messages = []
+            for m in messages:
+                serialized_messages.append({
+                    "role": m.type,
+                    "content": m.content,
+                    "id": m.id if hasattr(m, "id") else None
+                })
+
+            # Call summarization agent using helper
+            result = call_summarization_agent(
+                agent_url=agent_url,
+                messages=serialized_messages,
+                keep_last=2,
+                client_id=state.get("client_id", "default")
+            )
+
+            if result:
+                print(f"Summarization completed: {result}")
+
+                # Extract the summarized messages from the A2A response
+                from a2a_client_helper import extract_a2a_response_text
+                import json
+                
+                try:
+                    # Get the text content from the A2A response
+                    response_text = extract_a2a_response_text(result)
+                    
+                    # Parse the JSON to get the list of summarized message dicts
+                    summarized_message_dicts = json.loads(response_text)
+                    
+                    # Convert the message dicts back to BaseMessage objects
+                    summarized_messages = []
+                    for msg_dict in summarized_message_dicts:
+                        msg_type = msg_dict.get("type", "human")
+                        content = msg_dict.get("data", {}).get("content", msg_dict.get("content", ""))
+                        
+                        if msg_type == "ai":
+                            summarized_messages.append(AIMessage(content=content))
+                        else:  # human or default
+                            summarized_messages.append(HumanMessage(content=content))
+                    
+                    # Remove old messages and add the summarized ones
+                    messages_to_remove = messages[:-2]
+                    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_remove if hasattr(m, 'id')]
+                    
+                    # Return the summarized messages plus delete operations
+                    return {"messages": summarized_messages + delete_messages}
+                    
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    print(f"WARNING: Failed to parse summarized messages: {e}. Using placeholder.")
+                    
+                    # Fallback to placeholder if parsing fails
+                    #summary_message = SystemMessage(content="[Previous conversation summarized]")
+                    messages_to_remove = messages[:-2]
+                    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_remove if hasattr(m, 'id')]
+                    return {"messages": delete_messages}
+
+        return {'ui_messages': [AIMessage(content="Processing Conversation...")]}
+
+    async def stream(self, query: str, context_id: str = "default", client_id: str = None, project_id: str = None):
         """
         Streams responses from the FlashBrain Graph for A2A protocol.
 
@@ -512,34 +630,52 @@ class FlashBrainAgent:
                 - require_user_input: bool
                 - content: str
         """
-        from collections.abc import AsyncIterable
-
-        app = build_flashbrain_graph()
-        config = {"configurable": {"thread_id": session_id}}
+        config = {"configurable": {"thread_id": context_id}}
 
         try:
             final_response = ""
 
-            for event in app.stream(
-                {"messages": [HumanMessage(content=query)], "user_id": user_id, "project_id": project_id},
-                config=config
+            # Use 'updates' mode to capture state changes including ui_messages
+            # subgraphs=True ensures we get updates from A2A agents too
+            async for event in self.graph.astream(
+                {"messages": [HumanMessage(content=query)], "client_id": client_id, "project_id": project_id},
+                config=config, 
+                stream_mode='updates',
+                subgraphs=True
             ):
-                logger.info(f"DEBUG: Stream query: {query}, type: {type(query)}")
-                for key, value in event.items():
-                    logger.info(f"DEBUG: Stream event key: {key}, value type: {type(value)}")
-                    if value is None:
-                         logger.info("DEBUG: Value is None!")
-                         continue
-                    if "messages" in value and value["messages"]:
-                        last_msg = value["messages"][-1]
-                        if isinstance(last_msg, AIMessage):
-                            final_response = last_msg.content
-                            # Yield intermediate updates
-                            yield {
-                                'is_task_complete': False,
-                                'require_user_input': False,
-                                'content': f"Processing: {key}..."
-                            }
+                # In updates mode, events are tuples: (namespace, node_updates)
+                # namespace is () for main graph or ('node_name:task_id',) for subgraphs
+                # node_updates is a dict with the node name as key and state updates as value
+                
+                if len(event) == 2:
+                    namespace, node_updates = event
+                    
+                    # Iterate through each node's updates
+                    for node_name, state_update in node_updates.items():
+                        # Check for ui_messages in the state update (intermediate status messages)
+                        if "ui_messages" in state_update and state_update["ui_messages"]:
+                            for ui_msg in state_update["ui_messages"]:
+                                if isinstance(ui_msg, AIMessage) and ui_msg.content:
+                                    final_response = ui_msg.content
+                                    # Yield each ui_message
+                                    yield {
+                                        'is_task_complete': False,
+                                        'require_user_input': False,
+                                        'content': ui_msg.content
+                                    }
+                        
+                        # Also check regular messages for all AI responses
+                        if "messages" in state_update and state_update["messages"]:
+                            for msg in state_update["messages"]:
+                                if isinstance(msg, AIMessage) and msg.content:
+                                    # Skip if this is just a repeat of what we already yielded
+                                    if msg.content != final_response or not final_response:
+                                        final_response = msg.content
+                                        yield {
+                                            'is_task_complete': False,
+                                            'require_user_input': False,
+                                            'content': msg.content
+                                        }
 
             # Final response
             if final_response:
@@ -550,19 +686,20 @@ class FlashBrainAgent:
                 }
             else:
                 yield {
-                    'is_task_complete': False,
-                    'require_user_input': True,
-                    'content': "I need more information to process your request."
+                    'is_task_complete': True,
+                    'require_user_input': False,
+                    'content': "Task completed."
                 }
 
         except Exception as e:
+            logger.error(f"Stream error: {e}")
             yield {
                 'is_task_complete': False,
                 'require_user_input': True,
                 'content': f"An error occurred: {str(e)}"
             }
 
-    def invoke(self, message: str, user_id: str = None, thread_id: str = "default", project_id: str = None) -> Dict[str, Any]:
+    def invoke(self, message: str, client_id: str = None, thread_id: str = "default", project_id: str = None) -> Dict[str, Any]:
         """
         Invokes the FlashBrain Graph.
         """
@@ -573,21 +710,20 @@ class FlashBrainAgent:
                 parsed = json.loads(message)
                 if isinstance(parsed, dict):
                     message = parsed.get("message", message)
-                    user_id = parsed.get("user_id", user_id)
+                    client_id = parsed.get("client_id", client_id)
                     thread_id = parsed.get("thread_id", thread_id)
                     project_id = parsed.get("project_id", project_id)
             except:
                 pass
 
-        app = build_flashbrain_graph()
-        config: RunnableConfig = {"configurable": {"thread_id": thread_id}} 
+        config = {"configurable": {"thread_id": thread_id}} 
         
         # We need to collect the output since it streams
         final_response = ""
         full_state = {}
         
-        for event in app.stream(
-            {"messages": [HumanMessage(content=message)], "user_id": user_id, "project_id": project_id},
+        for event in self.graph.stream(
+            {"messages": [HumanMessage(content=message)], "client_id": client_id, "project_id": project_id},
             config=config
         ):
             for key, value in event.items():
@@ -601,16 +737,22 @@ class FlashBrainAgent:
             "response": final_response,
             "full_state": str(full_state) # Convert to string for safe serialization
         }
-def test():
+
+async def test():
     agent = FlashBrainAgent()
-    response = agent.invoke("Hello, how are you?")
-    print(response)
+    message = """The Project Manager needs to know accounting skills. Can you help me find a freelancer with accounting skills?"""
+    project_id = '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc'
+    client_id = '9a76be62-0d44-4a34-913d-08dcac008de5'
+    
+    print("\n=== Streaming Response ===")
+    async for item in agent.stream(message, project_id=project_id, client_id=client_id):
+        print(f"[{item.get('is_task_complete')}] {item.get('content')}")
 
 if __name__ == "__main__":
-    # Uncomment to run test
-    # test()
+
+    asyncio.run(test())# Uncomment to run test
 
     # Start A2A server
-    port = int(os.getenv("PORT", 8010))
-    print(f"Starting FlashBrain Orchestrator on port {port}...")
-    run_server(FlashBrainAgent(), port=port)
+    #port = int(os.getenv("PORT", 8010))
+    #print(f"Starting FlashBrain Orchestrator on port {port}...")
+    #run_server(FlashBrainAgent(), port=port)

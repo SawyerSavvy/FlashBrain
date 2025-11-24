@@ -133,7 +133,7 @@ async def main() -> None:
             }
         }
         message = Message(**message_data)
-        await print_responses(client.send_message(message))
+        #await print_responses(client.send_message(message))
 
         # Test 2: Add new project phase
         logger.info('\n=== Test 2: Add New Project Phase ===')
@@ -153,7 +153,7 @@ async def main() -> None:
             }
         }
         phase_message = Message(**phase_message_data)
-        await print_responses(client.send_message(phase_message))
+        #await print_responses(client.send_message(phase_message))
 
         # Test 3: Match freelancers for project
         logger.info('\n=== Test 3: Match Freelancers ===')
@@ -162,7 +162,7 @@ async def main() -> None:
             'parts': [
                 {
                     'kind': 'text',
-                    'text': 'Add a AI Researcher role to the first project phase.',
+                    'text': 'Add Accounting skills to the Project Manager in the project.',
                 }
             ],
             'message_id': uuid4().hex,

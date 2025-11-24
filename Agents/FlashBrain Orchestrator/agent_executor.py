@@ -52,20 +52,20 @@ class FlashBrainAgentExecutor(AgentExecutor):
 
         try:
             # Extract additional parameters from message metadata if available
-            user_id = None
+            client_id = None
             project_id = None
 
             if hasattr(context, 'message') and context.message:
                 metadata = getattr(context.message, 'metadata', None)
                 if metadata:
-                    user_id = metadata.get('user_id')
+                    client_id = metadata.get('client_id')
                     project_id = metadata.get('project_id')
 
             # Stream responses from the agent
             async for item in self.agent.stream(
                 query,
                 context_id=task.context_id,
-                user_id=user_id,
+                client_id=client_id,
                 project_id=project_id
             ):
                 is_task_complete = item.get('is_task_complete', False)

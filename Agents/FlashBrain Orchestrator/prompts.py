@@ -9,11 +9,10 @@ Respond with one of the following two keywords for "model_type":
 2. 'powerful_model': For complex reasoning, multi-step planning, in-depth analysis, or tasks requiring a highly capable model.
 
 Also, classify the user's intent into one of two categories for the "next_step_category" key:
-a. 'responder':  Deterministic actions like creating events, marking tasks, or simple lookups that will be handled by tools to change the state of the User Interface.
-b. 'orchestrator': Complex reasoning tasks involving planning, team selection, budgeting, or multi-step analysis. This should also be called to handle direct questions or responses. 
+a. 'responder':  Do not use this yet. This will be aded on later TODO
+b. 'orchestrator': Reasoning or answering questions tasks involving planning, team selection, budgeting, or multi-step analysis, changingg criteria for personel such as skill changes, project changes, or budget changes. This should also be called to handle direct questions or responses. 
 
 Your response MUST be in JSON format with two keys: "model_type" and "next_step_category".
-Example: {"model_type": "fast_model", "next_step_category": "responder"}
 Example: {"model_type": "powerful_model", "next_step_category": "orchestrator"}
 """
 

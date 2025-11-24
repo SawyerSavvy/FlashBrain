@@ -42,9 +42,11 @@ class PhaseUpdate(BaseModel):
     tasks: Optional[List[str]] = Field(None, description="List of tasks in the phase")
 
 class RoleUpdate(BaseModel):
-    role_id: Optional[str] = Field(None, description="UUID of the role if known, else None")
+    id: Optional[str] = Field(None, description="UUID of the unique role record if known, else None")
     phase_id: Optional[str] = Field(None, description="UUID of the phase this role belongs to")
     role_name: Optional[str] = Field(None, description="Name of the role")
+    role_id: Optional[str] = Field(None, description="UUID of the role if known, else None")
+    role_slot: Optional[str] = Field(None, description="Slot of the role")
     description: Optional[str] = Field(None, description="Detailed description of the role")
     role_skills: Optional[List[str]] = Field(None, description="List of required skills")
     budget_pct: Optional[float] = Field(None, description="Budget percentage for this role")
@@ -174,6 +176,7 @@ class SelectFreelancerAgent:
         
         try:
             response = structured_llm.invoke(prompt)
+
             # response is an instance of RequirementsOutput
             extracted_updates = response.model_dump()
             reasoning = extracted_updates.pop("reasoning", "")
@@ -226,27 +229,25 @@ class SelectFreelancerAgent:
     
             # Update Roles
             for role in roles:
-                role_id = role.get("role_id")
+                record_id = role.get("id")  # The unique record ID
                 role_name = role.get("role_name")
-                phase_id = role.get("phase_id") # Might be needed to find role
+                phase_id = role.get("phase_id")
                 
-                # If we don't have role_id, try to find it. 
-                # This is harder without exact mapping, but let's assume we might find it by specialized_role_name if it exists
-                # or we skip if we can't identify the role.
-                # For now, we proceed only if we have role_id or can find it.
-                
-                if not role_id and role_name and project_id:
-                     # Try to find by specialized_role_name? Or maybe we can't easily.
-                     # Let's skip lookup for now to avoid complexity and assume ID is provided or we skip.
-                     pass
+                # If we don't have the record id, try to find it
+                if not record_id and role_name and project_id and phase_id:
+                    # Try to find by role_name and phase_id
+                    res = supabase.table("project_phase_roles").select("id").eq("project_id", project_id).eq("phase_id", phase_id).execute()
+                    if res.data:
+                        # If multiple matches, we'd need more logic. For now just take first.
+                        record_id = res.data[0]["id"]
     
-                if role_id:
+                if record_id:
                     update_data = {
-                        k:v for k,v in role.items() if v is not None
+                        k:v for k,v in role.items() if v is not None and k != "id"  # Exclude id from update data
                     }
     
                     if update_data:
-                        supabase.table("project_phase_roles").update(update_data).eq("id", role_id).execute()
+                        result = supabase.table("project_phase_roles").update(update_data).eq("id", record_id).execute()
                         
             return {}
             
@@ -273,16 +274,16 @@ class SelectFreelancerAgent:
         
         # Collect IDs for re-optimization
         phase_ids = [p.get("phase_id") for p in phases if p.get("phase_id")]
-        role_ids = [r.get("role_id") for r in roles if r.get("role_id")]
+        ids = [r.get("id") for r in roles if r.get("id")]
         
         try:
-            if phase_ids or role_ids:
+            if phase_ids or ids:
                 # Call /reoptimize-targets
                 endpoint = f"{service_url.rstrip('/')}/reoptimize-targets"
                 payload = {
                     "project_id": project_id,
                     "phase_ids": phase_ids,
-                    "phase_role_ids": role_ids,
+                    "phase_role_ids": ids,
                     "max_results": 20
                 }
                 response = requests.post(endpoint, json=payload)

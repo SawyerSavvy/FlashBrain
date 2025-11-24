@@ -5,6 +5,13 @@ import requests
 from typing import Dict, Any, Optional
 import logging
 
+import httpx
+from uuid import uuid4
+from a2a.client import A2ACardResolver, ClientFactory, ClientConfig
+from a2a.types import AgentCard, Message
+
+import asyncio
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,16 +107,16 @@ def extract_a2a_response_text(result: Dict[str, Any]) -> str:
     return f"Response: {str(result)}"
 
 
-def call_project_decomp_agent(
+async def call_project_decomp_agent(
     agent_url: str,
     message: str,
     project_id: Optional[str] = None,
     client_id: Optional[str] = None,
     exist: bool = False,
     context_id: str = "default"
-) -> str:
+):
     """
-    Convenience function to call the Project Decomposition Agent.
+    Calls Project Decomposition Agent via A2A and yields streaming updates.
 
     Args:
         agent_url: URL of the Project Decomp agent
@@ -119,59 +126,140 @@ def call_project_decomp_agent(
         exist: Whether the project already exists
         context_id: Context ID
 
-    Returns:
-        Formatted response text
+    Yields:
+        String updates as they arrive from the A2A agent
     """
     try:
-        metadata = {
-            "project_id": project_id,
-            "client_id": client_id,
-            "exist": exist
-        }
-
-        result = call_a2a_agent(agent_url, message, metadata, context_id)
-        response_text = extract_a2a_response_text(result)
-        return f"Project Decomposition:\n{response_text}"
-
-    except requests.RequestException as e:
-        logger.error(f"Project Decomp Agent call failed: {e}")
-        return f"Failed to contact Project Decomposition Agent: {e}"
+        async with httpx.AsyncClient(timeout=60.0) as httpx_client:
+            resolver = A2ACardResolver(
+                httpx_client=httpx_client,
+                base_url=agent_url,
+            )
+            
+            try:
+                agent_card = await resolver.get_agent_card()
+            except Exception:
+                resp = await httpx_client.get(f"{agent_url}/a2a/agent.json")
+                resp.raise_for_status()
+                agent_card = AgentCard.model_validate(resp.json())
+            
+            client_config = ClientConfig(httpx_client=httpx_client)
+            client = await ClientFactory.connect(
+                agent=agent_card,
+                client_config=client_config
+            )
+            
+            message_data = {
+                'role': 'user',
+                'parts': [{'kind': 'text', 'text': message}],
+                'message_id': uuid4().hex,
+                'metadata': {
+                    'project_id': project_id,
+                    'client_id': client_id,
+                    'exist': exist
+                }
+            }
+            a2a_message = Message(**message_data)
+            
+            async for item in client.send_message(a2a_message):
+                text_content = None
+                if isinstance(item, tuple):
+                    task, update = item
+                    if hasattr(update, 'status') and update.status:
+                        if hasattr(update.status, 'message') and update.status.message:
+                            msg = update.status.message
+                            if hasattr(msg, 'parts') and msg.parts:
+                                for part in msg.parts:
+                                    if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                                        text_content = part.root.text
+                else:
+                    if hasattr(item, 'parts') and item.parts:
+                        for part in item.parts:
+                            if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                                text_content = part.root.text
+                
+                # Yield each update as it arrives
+                if text_content:
+                    yield text_content
     except Exception as e:
-        logger.error(f"Error calling Project Decomp Agent: {e}")
-        return f"Error processing project decomposition: {e}"
+        logger.error(f"Project Decomp Agent call failed: {e}")
+        yield f"Failed to contact Project Decomposition Agent: {e}"
 
 
-def call_freelancer_agent(
+async def call_freelancer_agent(
     agent_url: str,
     message: str,
     project_id: Optional[str] = None,
+    client_id: Optional[str] = None,
     context_id: str = "default"
-) -> str:
+):
     """
-    Convenience function to call the Select Freelancer Agent.
+    Calls Select Freelancer Agent via A2A and yields streaming updates.
 
     Args:
         agent_url: URL of the Freelancer agent
         message: User message
         project_id: Project ID
+        client_id: Client ID
         context_id: Context ID
 
-    Returns:
-        Formatted response text
+    Yields:
+        String updates as they arrive from the A2A agent
     """
     try:
-        metadata = {"project_id": project_id}
-
-        result = call_a2a_agent(agent_url, message, metadata, context_id)
-        response_text = extract_a2a_response_text(result)
-        return f"Freelancer Selection:\n{response_text}"
-
-    except requests.RequestException as e:
-        logger.error(f"Freelancer Agent call failed: {e}")
-        return f"Failed to contact Freelancer Selection Agent: {e}"
+        async with httpx.AsyncClient(timeout=60.0) as httpx_client:
+            resolver = A2ACardResolver(
+                httpx_client=httpx_client,
+                base_url=agent_url,
+            )
+            
+            try:
+                agent_card = await resolver.get_agent_card()
+            except Exception:
+                resp = await httpx_client.get(f"{agent_url}/a2a/agent.json")
+                resp.raise_for_status()
+                agent_card = AgentCard.model_validate(resp.json())
+            
+            client_config = ClientConfig(httpx_client=httpx_client)
+            client = await ClientFactory.connect(
+                agent=agent_card,
+                client_config=client_config
+            )
+            
+            message_data = {
+                'role': 'user',
+                'parts': [{'kind': 'text', 'text': message}],
+                'message_id': uuid4().hex,
+                'metadata': {
+                    'project_id': project_id,
+                    'client_id': client_id
+                }
+            }
+            a2a_message = Message(**message_data)
+            
+            async for item in client.send_message(a2a_message):
+                text_content = None
+                if isinstance(item, tuple):
+                    task, update = item
+                    if hasattr(update, 'status') and update.status:
+                        if hasattr(update.status, 'message') and update.status.message:
+                            msg = update.status.message
+                            if hasattr(msg, 'parts') and msg.parts:
+                                for part in msg.parts:
+                                    if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                                        text_content = part.root.text
+                else:
+                    if hasattr(item, 'parts') and item.parts:
+                        for part in item.parts:
+                            if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                                text_content = part.root.text
+                
+                # Yield each update as it arrives
+                if text_content:
+                    yield text_content
     except Exception as e:
-        logger.error(f"Error calling Freelancer Agent: {e}")
-        return f"Error processing freelancer selection: {e}"
+        logger.error(f"Freelancer Agent call failed: {e}", exc_info=True)
+        yield f"Failed to contact Freelancer Selection Agent: {e}"
 
 
 def call_summarization_agent(
