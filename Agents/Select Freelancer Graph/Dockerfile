@@ -22,4 +22,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
 # Run the application
-CMD exec uvicorn __main__:app --host 0.0.0.0 --port ${PORT} --workers 1
+CMD python __main__.py --host 0.0.0.0 --port ${PORT:-8080}

@@ -16,7 +16,6 @@ import asyncio
 
 from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT
 # --- A2A Integration ---
-from python_a2a import run_server
 from a2a_client_helper import call_project_decomp_agent, call_freelancer_agent, call_summarization_agent
 
 load_dotenv()

@@ -25,7 +25,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    base_url = 'http://localhost:8010'
+    base_url = 'https://flashbrain-orchestrator-935893169019.us-central1.run.app'
 
     async with httpx.AsyncClient(timeout=60.0) as httpx_client:
         # Initialize A2ACardResolver
@@ -119,7 +119,7 @@ async def main() -> None:
             }
         }
         planning_message = Message(**planning_message_data)
-        await print_responses(client.send_message(planning_message))
+        #await print_responses(client.send_message(planning_message))
 
 
 if __name__ == '__main__':

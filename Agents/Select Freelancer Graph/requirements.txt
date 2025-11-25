@@ -1,5 +1,5 @@
 # A2A Protocol Dependencies
-python-a2a>=0.3.0  # Official Google A2A SDK
+a2a-sdk[http-server]>=0.3.16  # Official Google A2A SDK
 httpx>=0.24.0
 uvicorn>=0.23.0
 click>=8.1.0
