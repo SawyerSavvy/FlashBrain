@@ -160,14 +160,14 @@ steps:
       - '-c'
       - |
         # Get service URLs
-        PROJECT_DECOMP_URL=$(gcloud run services describe project-decomp-agent --region=us-central1 --format='value(status.url)')
-        FREELANCER_URL=$(gcloud run services describe select-freelancer-agent --region=us-central1 --format='value(status.url)')
-        SUMMARIZE_URL=$(gcloud run services describe summarize-agent --region=us-central1 --format='value(status.url)')
+        PROJECT_DECOMP_URL=$$(gcloud run services describe project-decomp-agent --region=us-central1 --format='value(status.url)')
+        FREELANCER_URL=$$(gcloud run services describe select-freelancer-agent --region=us-central1 --format='value(status.url)')
+        SUMMARIZE_URL=$$(gcloud run services describe summarize-agent --region=us-central1 --format='value(status.url)')
 
         # Update orchestrator with agent URLs
         gcloud run services update flashbrain-orchestrator \
           --region=us-central1 \
-          --update-env-vars="PROJECT_DECOMP_AGENT_URL=$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$FREELANCER_URL,SUMMARIZATION_AGENT_URL=$SUMMARIZE_URL"
+          --update-env-vars="PROJECT_DECOMP_AGENT_URL=$$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$$FREELANCER_URL,SUMMARIZATION_AGENT_URL=$$SUMMARIZE_URL"
     waitFor: ['deploy-orchestrator']
 
 # Images to store in Container Registry (with versioning)
