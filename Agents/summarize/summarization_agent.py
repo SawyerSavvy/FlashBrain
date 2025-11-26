@@ -2,7 +2,7 @@ import os
 from typing import List, Union, Dict, Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, message_to_dict, messages_from_dict
-from python_a2a import run_server, AgentCard, AgentSkill
+from a2a.types import AgentCard, AgentSkill
 
 import logging
 logging.basicConfig(level=logging.DEBUG)

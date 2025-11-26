@@ -7,10 +7,9 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from python_a2a import A2AClient, Message, MessageRole
 
 # --- A2A Integration ---
-from python_a2a import run_server, AgentCard, AgentSkill
+from a2a.types import AgentCard, AgentSkill
 import json
 
 from supabase import create_client, Client

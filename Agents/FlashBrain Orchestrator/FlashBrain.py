@@ -6,6 +6,7 @@ import logging
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_core.tools import tool
@@ -99,38 +100,63 @@ class GeminiModel:
 
 class FlashBrainAgent:
 
-    SUPPORTED_CONTENT_TYPES = [
-        # Currently implemented:
-        'text',
-        'text/plain',
-        'application/json',  # Used for structured A2A agent communication
-        
-        # TODO: Requires document parsing implementation:
-        'application/pdf',  # PDF documents - needs PDF extraction
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx - needs docx parsing
-        'text/markdown',  # Markdown files - needs markdown handling
-        
-        # TODO: Requires multimodal handling implementation:
-        'image/jpeg',  # Images - needs Gemini multimodal API integration
-        'image/png',
-        'image/webp',
-    ]
+    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain', 'application/json', 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/markdown', 'image/jpeg', 'image/png', 'image/webp'] 
 
-    def __init__(self):
-        print("FlashBrainAgent initialized")
+    def __init__(self, supabase_url: str = None, supabase_key: str = None, postgres_connection: str = None):
+        """
+        Initialize FlashBrain Agent with optional Supabase persistence.
+        
+        Args:
+            supabase_url: Supabase project URL (or from SUPABASE_URL env)
+            supabase_key: Supabase service role key (or from SUPABASE_SERVICE_ROLE_KEY env)
+            postgres_connection: PostgreSQL connection string (or from SUPABASE_TRANSACTION_POOLER env)
+        """
+        logger.info("FlashBrainAgent initialized")
+        
+        # Supabase configuration
+        self.supabase_url = supabase_url or os.getenv("SUPABASE_URL")
+        self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        self.postgres_connection = postgres_connection or os.getenv("SUPABASE_TRANSACTION_POOLER")
+        self.supabase_client = None
+        
+        # Initialize Supabase client for conversation history
+        if self.supabase_url and self.supabase_key:
+            try:
+                from supabase import create_client
+                self.supabase_client = create_client(self.supabase_url, self.supabase_key)
+                logger.info("Supabase client initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Supabase client: {e}")
+        
         # Initialize LLM clients
         self.model_clients: Dict[str, GeminiModel] = {}
         try:
             self.model_clients["routing"] = GeminiModel(model_name="gemini-2.5-flash-lite", temperature=0.0) # For gateway routing
             self.model_clients["fast"] = GeminiModel(model_name="gemini-2.5-flash", temperature=0.0) # For basic tasks
             self.model_clients["powerful"] = GeminiModel(model_name="gemini-2.5-pro", temperature=0.1) # For complex orchestrator tasks
-            print("All Gemini LLM clients initialized.")
+            logger.info("All Gemini LLM clients initialized.")
         except Exception as e:
-            print(f"Error initializing one or more Gemini LLM clients: {e}. Some functionalities might be degraded.")
+            logger.error(f"Failed to initialize Gemini clients: {e}")
+            raise
         
-        self.graph = self._build_graph()
+        # Build the graph (checkpointer will be initialized here)
+        # Use asyncio.run since we're in sync __init__ but need async _build_graph
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        if loop.is_running():
+            # We're already in an async context, create a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                self.graph = executor.submit(lambda: loop.run_until_complete(self._build_graph())).result()
+        else:
+            self.graph = loop.run_until_complete(self._build_graph())
 
-    def _build_graph(self):
+    async def _build_graph(self):
         workflow = StateGraph(BrainState) 
 
         # Add Nodes
@@ -209,9 +235,98 @@ class FlashBrainAgent:
         workflow.add_edge("finops_agent", END)
         workflow.add_edge("responder", END)
 
-        # Add Checkpointer for Memory
-        memory = MemorySaver()
-        return workflow.compile(checkpointer=memory)
+        # Add Checkpointer for Memory - Use PostgreSQL for persistence
+        if self.postgres_connection:
+            try:
+                # Use connection pool approach with autocommit to avoid transaction issues
+                from psycopg_pool import AsyncConnectionPool
+                
+                pool = AsyncConnectionPool(
+                    conninfo=self.postgres_connection,
+                    max_size=20,
+                    min_size=1,
+                    kwargs={"autocommit": True, "prepare_threshold": None},
+                    open=False  # Don't auto-open (deprecated)
+                )
+                
+                await pool.open()  # Explicitly open the pool
+                
+                checkpointer = AsyncPostgresSaver(pool)
+                await checkpointer.setup()  # Create tables (works with autocommit)
+                logger.info("AsyncPostgreSQL checkpointer initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {e}. Falling back to in-memory.")
+                checkpointer = MemorySaver()
+        else:
+            logger.warning("No SUPABASE_TRANSACTION_POOLER configured, using in-memory checkpointer")
+            checkpointer = MemorySaver()
+
+        return workflow.compile(checkpointer=checkpointer)
+    
+
+    async def load_conversation_history(self, conversation_id: str, limit: int = 50) -> List[BaseMessage]:
+        """Load conversation history from Supabase brain_messages table."""
+        if not self.supabase_client:
+            return []
+
+        try:
+            response = self.supabase_client.table("brain_messages")\
+                .select("role, content, metadata, created_at")\
+                .eq("conversation_id", conversation_id)\
+                .order("created_at", desc=False)\
+                .limit(limit)\
+                .execute()
+
+            messages = []
+            for msg in response.data:
+                if msg["role"] == "human":
+                    messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "ai":
+                    messages.append(AIMessage(content=msg["content"]))
+                elif msg["role"] == "system":
+                    messages.append(SystemMessage(content=msg["content"]))
+
+            return messages
+        except Exception as e:
+            logger.error(f"Failed to load conversation history: {e}")
+            return []
+    
+    async def save_message(self, conversation_id: str, role: str, content: str, metadata: dict = None):
+        """Save a message to Supabase brain_messages table."""
+        if not self.supabase_client:
+            return
+
+        try:
+            self.supabase_client.table("brain_messages").insert({
+                "conversation_id": conversation_id,
+                "role": role,
+                "content": content,
+                "metadata": metadata or {}
+            }).execute()
+        except Exception as e:
+            logger.error(f"Failed to save message: {e}")
+    
+    async def ensure_conversation_exists(self, conversation_id: str, user_id: str = None):
+        """Ensure a conversation record exists in the database."""
+        if not self.supabase_client:
+            return
+
+        try:
+            # Check if conversation exists
+            response = self.supabase_client.table("brain_conversations")\
+                .select("id")\
+                .eq("id", conversation_id)\
+                .execute()
+
+            if not response.data:
+                # Create new conversation
+                self.supabase_client.table("brain_conversations").insert({
+                    "id": conversation_id,
+                    "user_id": user_id or "anonymous",
+                    "title": "New Conversation"
+                }).execute()
+        except Exception as e:
+            logger.error(f"Failed to ensure conversation exists: {e}")
 
     # --- Level 1: Gateway ---
     
@@ -632,6 +747,17 @@ class FlashBrainAgent:
         config = {"configurable": {"thread_id": context_id}}
 
         try:
+            # Ensure conversation exists in Supabase
+            await self.ensure_conversation_exists(context_id, client_id)
+            
+            # Save user message to Supabase
+            await self.save_message(
+                conversation_id=context_id,
+                role="human",
+                content=query,
+                metadata={"client_id": client_id, "project_id": project_id}
+            )
+            
             final_response = ""
 
             # Use 'updates' mode to capture state changes including ui_messages
@@ -678,12 +804,26 @@ class FlashBrainAgent:
 
             # Final response
             if final_response:
+                # Save AI response to Supabase
+                await self.save_message(
+                    conversation_id=context_id,
+                    role="ai",
+                    content=final_response,
+                    metadata={"client_id": client_id, "project_id": project_id}
+                )
                 yield {
                     'is_task_complete': True,
                     'require_user_input': False,
                     'content': final_response
                 }
             else:
+                # Save default completion message
+                await self.save_message(
+                    conversation_id=context_id,
+                    role="ai",
+                    content="Task completed.",
+                    metadata={"client_id": client_id, "project_id": project_id}
+                )
                 yield {
                     'is_task_complete': True,
                     'require_user_input': False,

@@ -56,7 +56,7 @@ class SummarizationAgentExecutor(AgentExecutor):
                     keep_last = metadata.get('keep_last', 2)
 
             # Stream responses from the agent
-            async for item in self.agent.stream(
+            for item in self.agent.stream(
                 query,
                 context_id=task.context_id,
                 keep_last=keep_last

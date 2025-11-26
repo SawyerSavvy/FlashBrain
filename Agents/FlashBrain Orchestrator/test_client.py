@@ -25,7 +25,10 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    base_url = 'https://flashbrain-orchestrator-935893169019.us-central1.run.app'
+    # For local testing
+    base_url = 'http://localhost:8010'
+    # For Cloud Run testing
+    # base_url = 'https://flashbrain-orchestrator-935893169019.us-central1.run.app'
 
     async with httpx.AsyncClient(timeout=60.0) as httpx_client:
         # Initialize A2ACardResolver
@@ -88,13 +91,15 @@ async def main() -> None:
                                 print(f"[message] {part.root.text}")
 
         # Test 1: Simple greeting
+        context_id = str(uuid4())
         logger.info('\n=== Test 1: Simple Greeting ===')
         message_data = {
             'role': 'user',
+            'context_id': context_id,  # Set context_id in the message
             'parts': [
                 {
                     'kind': 'text',
-                    'text': 'Hello, what is your name?',
+                    'text': 'Hello, My name is Cole. what is your name?',
                 }
             ],
             'message_id': uuid4().hex,
@@ -102,14 +107,15 @@ async def main() -> None:
         message = Message(**message_data)
         await print_responses(client.send_message(message))
 
-        # Test 2: Project planning request (triggers Orchestrator -> Planning Agent)
-        logger.info('\n=== Test 2: Project Planning Request ===')
+        # Test 2: Continue conversation (should remember the name "Cole")
+        logger.info('\n=== Test 2: Conversation Continuity Test ===')
         planning_message_data = {
             'role': 'user',
+            'context_id': context_id,  # Use the SAME context_id to continue the conversation
             'parts': [
                 {
                     'kind': 'text',
-                    'text': 'Add Accouting skills to the Project Manager in this project.',
+                    'text': 'What is my name?',
                 }
             ],
             'message_id': uuid4().hex,
@@ -119,7 +125,7 @@ async def main() -> None:
             }
         }
         planning_message = Message(**planning_message_data)
-        #await print_responses(client.send_message(planning_message))
+        await print_responses(client.send_message(planning_message))
 
 
 if __name__ == '__main__':

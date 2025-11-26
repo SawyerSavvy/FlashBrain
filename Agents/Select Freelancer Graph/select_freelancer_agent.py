@@ -13,7 +13,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 
 # --- A2A Integration ---
-from python_a2a import run_server, AgentCard, AgentSkill
+from a2a.types import AgentCard, AgentSkill
 
 try:
     from supabase import create_client, Client
