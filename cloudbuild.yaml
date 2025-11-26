@@ -7,7 +7,9 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator'
+      - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator:latest'
       - '-f'
       - 'Agents/FlashBrain Orchestrator/Dockerfile'
       - 'Agents/FlashBrain Orchestrator'
@@ -18,7 +20,9 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/project-decomp-agent'
+      - 'gcr.io/$PROJECT_ID/project-decomp-agent:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/project-decomp-agent:latest'
       - '-f'
       - 'Agents/Project Decomp Graph/Dockerfile'
       - 'Agents/Project Decomp Graph'
@@ -29,7 +33,9 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/select-freelancer-agent'
+      - 'gcr.io/$PROJECT_ID/select-freelancer-agent:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/select-freelancer-agent:latest'
       - '-f'
       - 'Agents/Select Freelancer Graph/Dockerfile'
       - 'Agents/Select Freelancer Graph'
@@ -40,47 +46,30 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/summarize-agent'
+      - 'gcr.io/$PROJECT_ID/summarize-agent:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/summarize-agent:latest'
       - '-f'
       - 'Agents/summarize/Dockerfile'
       - 'Agents/summarize'
     id: 'build-summarize'
 
-  # Push all images to Container Registry
+  # Push all images to Container Registry with all tags
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/flashbrain-orchestrator']
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/flashbrain-orchestrator']
     waitFor: ['build-orchestrator']
-  
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/project-decomp-agent']
-    waitFor: ['build-project-decomp']
-  
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/select-freelancer-agent']
-    waitFor: ['build-freelancer']
-  
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/summarize-agent']
-    waitFor: ['build-summarize']
 
-  # Deploy FlashBrain Orchestrator (min-instances=1)
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: gcloud
-    args:
-      - 'run'
-      - 'deploy'
-      - 'flashbrain-orchestrator'
-      - '--image=gcr.io/$PROJECT_ID/flashbrain-orchestrator'
-      - '--region=us-central1'
-      - '--platform=managed'
-      - '--allow-unauthenticated'
-      - '--min-instances=1'
-      - '--max-instances=10'
-      - '--memory=1Gi'
-      - '--cpu-boost'
-      - '--timeout=300'
-      - '--concurrency=80'
-    id: 'deploy-orchestrator'
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/project-decomp-agent']
+    waitFor: ['build-project-decomp']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/select-freelancer-agent']
+    waitFor: ['build-freelancer']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/summarize-agent']
+    waitFor: ['build-summarize']
 
   # Deploy Project Decomp Agent (min-instances=0)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -89,15 +78,17 @@ steps:
       - 'run'
       - 'deploy'
       - 'project-decomp-agent'
-      - '--image=gcr.io/$PROJECT_ID/project-decomp-agent'
+      - '--image=gcr.io/$PROJECT_ID/project-decomp-agent:$COMMIT_SHA'
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--min-instances=0'
       - '--max-instances=5'
-      - '--memory=512Mi'
+      - '--memory=1Gi'
+      - '--cpu=2'
       - '--cpu-boost'
       - '--timeout=300'
+      - '--port=8080'
     id: 'deploy-project-decomp'
 
   # Deploy Select Freelancer Agent (min-instances=0)
@@ -107,15 +98,17 @@ steps:
       - 'run'
       - 'deploy'
       - 'select-freelancer-agent'
-      - '--image=gcr.io/$PROJECT_ID/select-freelancer-agent'
+      - '--image=gcr.io/$PROJECT_ID/select-freelancer-agent:$COMMIT_SHA'
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--min-instances=0'
       - '--max-instances=5'
-      - '--memory=512Mi'
+      - '--memory=1Gi'
+      - '--cpu=2'
       - '--cpu-boost'
       - '--timeout=300'
+      - '--port=8080'
     id: 'deploy-freelancer'
 
   # Deploy Summarize Agent (min-instances=0)
@@ -125,16 +118,40 @@ steps:
       - 'run'
       - 'deploy'
       - 'summarize-agent'
-      - '--image=gcr.io/$PROJECT_ID/summarize-agent'
+      - '--image=gcr.io/$PROJECT_ID/summarize-agent:$COMMIT_SHA'
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--min-instances=0'
       - '--max-instances=3'
-      - '--memory=512Mi'
+      - '--memory=1Gi'
+      - '--cpu=1'
       - '--cpu-boost'
       - '--timeout=300'
+      - '--port=8080'
     id: 'deploy-summarize'
+
+  # Deploy FlashBrain Orchestrator (min-instances=1, deployed last so it gets the URLs)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'flashbrain-orchestrator'
+      - '--image=gcr.io/$PROJECT_ID/flashbrain-orchestrator:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--min-instances=1'
+      - '--max-instances=10'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--cpu-boost'
+      - '--timeout=300'
+      - '--concurrency=80'
+      - '--port=8080'
+    waitFor: ['deploy-project-decomp', 'deploy-freelancer', 'deploy-summarize']
+    id: 'deploy-orchestrator'
 
   # Update Orchestrator with inter-service URLs
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -146,19 +163,23 @@ steps:
         PROJECT_DECOMP_URL=$(gcloud run services describe project-decomp-agent --region=us-central1 --format='value(status.url)')
         FREELANCER_URL=$(gcloud run services describe select-freelancer-agent --region=us-central1 --format='value(status.url)')
         SUMMARIZE_URL=$(gcloud run services describe summarize-agent --region=us-central1 --format='value(status.url)')
-        
-        # Update orchestrator
+
+        # Update orchestrator with agent URLs
         gcloud run services update flashbrain-orchestrator \
           --region=us-central1 \
-          --update-env-vars="PROJECT_DECOMP_AGENT_URL=$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$FREELANCER_URL,SUMMARIZE_AGENT_URL=$SUMMARIZE_URL"
-    waitFor: ['deploy-orchestrator', 'deploy-project-decomp', 'deploy-freelancer', 'deploy-summarize']
+          --update-env-vars="PROJECT_DECOMP_AGENT_URL=$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$FREELANCER_URL,SUMMARIZATION_AGENT_URL=$SUMMARIZE_URL"
+    waitFor: ['deploy-orchestrator']
 
-# Images to store in Container Registry
+# Images to store in Container Registry (with versioning)
 images:
-  - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator'
-  - 'gcr.io/$PROJECT_ID/project-decomp-agent'
-  - 'gcr.io/$PROJECT_ID/select-freelancer-agent'
-  - 'gcr.io/$PROJECT_ID/summarize-agent'
+  - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/flashbrain-orchestrator:latest'
+  - 'gcr.io/$PROJECT_ID/project-decomp-agent:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/project-decomp-agent:latest'
+  - 'gcr.io/$PROJECT_ID/select-freelancer-agent:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/select-freelancer-agent:latest'
+  - 'gcr.io/$PROJECT_ID/summarize-agent:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/summarize-agent:latest'
 
 # Build timeout
 timeout: '3600s'
