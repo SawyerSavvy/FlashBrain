@@ -49,10 +49,13 @@ def main(host, port):
             ],
         )
 
+        # Use SUMMARIZATION_PUBLIC_URL env var for Cloud Run, fallback to host:port for local
+        public_url = os.getenv('SUMMARIZATION_PUBLIC_URL', f'http://{host}:{port}')
+
         agent_card = AgentCard(
             name='Summarization Agent',
             description='An agent that summarizes conversation history, helping manage context length.',
-            url=f'http://{host}:{port}/',
+            url=public_url,
             version='1.0.0',
             default_input_modes=SummarizationAgent.SUPPORTED_CONTENT_TYPES,
             default_output_modes=SummarizationAgent.SUPPORTED_CONTENT_TYPES,

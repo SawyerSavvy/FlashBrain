@@ -51,10 +51,13 @@ def main(host, port):
             ],
         )
 
+        # Use ORCHESTRATOR_PUBLIC_URL env var for Cloud Run, fallback to host:port for local
+        public_url = os.getenv('ORCHESTRATOR_PUBLIC_URL', f'http://{host}:{port}')
+
         agent_card = AgentCard(
             name='FlashBrain Orchestrator',
             description='The central orchestrator for the FlashBrain system, managing project planning, team selection, and financial operations.',
-            url=f'http://{host}:{port}/',
+            url=public_url,
             version='1.0.0',
             default_input_modes=FlashBrainAgent.SUPPORTED_CONTENT_TYPES,
             default_output_modes=FlashBrainAgent.SUPPORTED_CONTENT_TYPES,

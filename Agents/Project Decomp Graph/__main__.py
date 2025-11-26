@@ -56,10 +56,13 @@ def main(host, port):
             ],
         )
 
+        # Use PROJECT_DECOMP_PUBLIC_URL env var for Cloud Run, fallback to host:port for local
+        public_url = os.getenv('PROJECT_DECOMP_PUBLIC_URL', f'http://{host}:{port}')
+
         agent_card = AgentCard(
             name='Project Decomposition Agent',
             description='An agent that decomposes projects into manageable phases and tasks, storing them in Supabase.',
-            url=f'http://{host}:{port}/',
+            url=public_url,
             version='1.0.0',
             default_input_modes=ProjectDecompAgent.SUPPORTED_CONTENT_TYPES,
             default_output_modes=ProjectDecompAgent.SUPPORTED_CONTENT_TYPES,

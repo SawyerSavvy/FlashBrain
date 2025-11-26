@@ -153,21 +153,35 @@ steps:
     waitFor: ['deploy-project-decomp', 'deploy-freelancer', 'deploy-summarize']
     id: 'deploy-orchestrator'
 
-  # Update Orchestrator with inter-service URLs
+  # Update all services with their PUBLIC_URL and inter-service URLs
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: bash
     args:
       - '-c'
       - |
         # Get service URLs
+        ORCHESTRATOR_URL=$$(gcloud run services describe flashbrain-orchestrator --region=us-central1 --format='value(status.url)')
         PROJECT_DECOMP_URL=$$(gcloud run services describe project-decomp-agent --region=us-central1 --format='value(status.url)')
         FREELANCER_URL=$$(gcloud run services describe select-freelancer-agent --region=us-central1 --format='value(status.url)')
         SUMMARIZE_URL=$$(gcloud run services describe summarize-agent --region=us-central1 --format='value(status.url)')
 
-        # Update orchestrator with agent URLs
+        # Update each service with its own PUBLIC_URL
+        gcloud run services update project-decomp-agent \
+          --region=us-central1 \
+          --update-env-vars="PROJECT_DECOMP_PUBLIC_URL=$$PROJECT_DECOMP_URL"
+
+        gcloud run services update select-freelancer-agent \
+          --region=us-central1 \
+          --update-env-vars="SELECT_FREELANCER_PUBLIC_URL=$$FREELANCER_URL"
+
+        gcloud run services update summarize-agent \
+          --region=us-central1 \
+          --update-env-vars="SUMMARIZATION_PUBLIC_URL=$$SUMMARIZE_URL"
+
+        # Update orchestrator with its PUBLIC_URL and agent URLs
         gcloud run services update flashbrain-orchestrator \
           --region=us-central1 \
-          --update-env-vars="PROJECT_DECOMP_AGENT_URL=$$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$$FREELANCER_URL,SUMMARIZATION_AGENT_URL=$$SUMMARIZE_URL"
+          --update-env-vars="ORCHESTRATOR_PUBLIC_URL=$$ORCHESTRATOR_URL,PROJECT_DECOMP_AGENT_URL=$$PROJECT_DECOMP_URL,SELECT_FREELANCER_AGENT_URL=$$FREELANCER_URL,SUMMARIZATION_AGENT_URL=$$SUMMARIZE_URL"
     waitFor: ['deploy-orchestrator']
 
 # Images to store in Container Registry (with versioning)

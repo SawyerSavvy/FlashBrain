@@ -56,10 +56,13 @@ def main(host, port):
             ],
         )
 
+        # Use SELECT_FREELANCER_PUBLIC_URL env var for Cloud Run, fallback to host:port for local
+        public_url = os.getenv('SELECT_FREELANCER_PUBLIC_URL', f'http://{host}:{port}')
+
         agent_card = AgentCard(
             name='Select Freelancer Agent',
             description='An agent that manages project phases and roles, and selects freelancers based on requirements.',
-            url=f'http://{host}:{port}/',
+            url=public_url,
             version='1.0.0',
             default_input_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
             default_output_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
