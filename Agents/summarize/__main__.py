@@ -23,7 +23,7 @@ from a2a.types import (
 from summarization_agent import SummarizationAgent
 from agent_executor import SummarizationAgentExecutor
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

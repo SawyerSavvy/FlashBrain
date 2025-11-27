@@ -23,7 +23,7 @@ from a2a.types import (
 from project_decomp_agent import ProjectDecompAgent
 from agent_executor import ProjectDecompAgentExecutor
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

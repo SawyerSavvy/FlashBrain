@@ -28,7 +28,7 @@ async def main() -> None:
     # For local testing
     base_url = 'http://localhost:8010'
     # For Cloud Run testing
-    # base_url = 'https://flashbrain-orchestrator-935893169019.us-central1.run.app'
+    #base_url = 'https://flashbrain-orchestrator-barrxvhqyq-uc.a.run.app'
 
     async with httpx.AsyncClient(timeout=60.0) as httpx_client:
         # Initialize A2ACardResolver
@@ -91,7 +91,7 @@ async def main() -> None:
                                 print(f"[message] {part.root.text}")
 
         # Test 1: Simple greeting
-        context_id = str(uuid4())
+        context_id = 'f77fb319-f01f-46a5-8d99-d031b625cca0'
         logger.info('\n=== Test 1: Simple Greeting ===')
         message_data = {
             'role': 'user',
@@ -99,13 +99,55 @@ async def main() -> None:
             'parts': [
                 {
                     'kind': 'text',
-                    'text': 'Hello, My name is Cole. what is your name?',
+                    'text': """The project, named SkillLink - Micro Mentorship Platform, is a two-sided marketplace platform designed to connect users with experts for short, on-demand mentoring sessions.
+
+**Project Description:**
+SkillLink aims to be a real-time mentorship platform facilitating 15-30 minute micro-mentoring sessions. These sessions can be conducted via video, voice, or chat, providing users with quick guidance for skill development, career advice, and tackling specific challenges.
+
+**Business Objectives:**
+The platform intends to generate revenue through several streams:
+*   Session commissions.
+*   A premium subscription model.
+*   Monetization of featured mentor listings.
+
+**Target Audience:**
+The platform is intended for college students, early-career professionals, self-learners, and entrepreneurs.
+
+**Key Requirements:**
+*   A real-time mentor matching system.
+*   Communication capabilities supporting video, voice, and chat.
+*   A time-based pricing system for sessions.
+*   Functionality for session recording.
+*   A system for mentor reviews and ratings.
+*   A feature to follow or bookmark mentors.
+*   An integrated calendar and reminder system.
+*   User profiles and authentication.
+*   Integration with a payment processing system.
+
+**Technical Architecture:**
+The project will involve a mobile application (iOS and Android) and a web application. The complexity is rated as high.
+
+**Project Specifications:**
+*   **Timeline:** 2 months
+*   **Budget:** $15,000
+*   **Priority:** High
+
+**Deliverables:**
+*   A mobile application for both iOS and Android.
+*   A web platform.
+
+**Additional Details:**
+Success metrics, risk factors, strategic recommendations, scalability planning, and a maintenance plan are yet to be defined or developed.""",
                 }
             ],
             'message_id': uuid4().hex,
+            'metadata': {
+                'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
+                'user_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
+            }
         }
         message = Message(**message_data)
-        await print_responses(client.send_message(message))
+        #await print_responses(client.send_message(message))
 
         # Test 2: Continue conversation (should remember the name "Cole")
         logger.info('\n=== Test 2: Conversation Continuity Test ===')
@@ -115,7 +157,7 @@ async def main() -> None:
             'parts': [
                 {
                     'kind': 'text',
-                    'text': 'What is my name?',
+                    'text': 'Create a project plan for SkillLink.',
                 }
             ],
             'message_id': uuid4().hex,
@@ -125,6 +167,7 @@ async def main() -> None:
             }
         }
         planning_message = Message(**planning_message_data)
+        # Use the SAME context_id to continue the conversation
         await print_responses(client.send_message(planning_message))
 
 

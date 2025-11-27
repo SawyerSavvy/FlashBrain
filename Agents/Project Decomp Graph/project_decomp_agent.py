@@ -16,7 +16,7 @@ from supabase import create_client, Client
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # Define the state for this subgraph
 class ProjectDecompState(TypedDict):

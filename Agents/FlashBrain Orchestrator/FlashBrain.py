@@ -19,7 +19,7 @@ from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_P
 # --- A2A Integration ---
 from a2a_client_helper import call_project_decomp_agent, call_freelancer_agent, call_summarization_agent
 
-load_dotenv()
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 

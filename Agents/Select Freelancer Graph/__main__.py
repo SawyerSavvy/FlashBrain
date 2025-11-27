@@ -23,7 +23,7 @@ from a2a.types import (
 from select_freelancer_agent import SelectFreelancerAgent
 from agent_executor import SelectFreelancerAgentExecutor
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
