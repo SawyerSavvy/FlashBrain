@@ -14,8 +14,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.prompts import ChatPromptTemplate
 import asyncio
+import json
 
-from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT
+from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT, INTENT_CLASSIFICATION_PROMPT
 # --- A2A Integration ---
 from a2a_client_helper import call_project_decomp_agent, call_freelancer_agent, call_summarization_agent
 
@@ -43,10 +44,21 @@ class GatewayRouterOutput(BaseModel):
     model_type: Literal["fast_model", "powerful_model"] = Field(..., description="The type of model to use for the next step.")
     next_step_category: Literal["orchestrator"] = Field(..., description="The category of the next step to take.")
 
+class TaskIntent(BaseModel):
+    """Schema for a single task in multi-intent requests."""
+    type: Literal["PROJECT_DECOMP", "SELECT_FREELANCER", "FINOPS", "DIRECT_ANSWER"] = Field(..., description="The type of task to execute.")
+    question: str = Field(..., description="The specific question or request for this task.")
+    priority: int = Field(..., description="Priority level (lower number = higher priority).")
+
 class OrchestratorOutput(BaseModel):
-    """Schema for the orchestrator's output."""
-    next_step_route: Literal["planning_agent", "team_selection_agent", "finops_agent", "answer_directly"] = Field(..., description="The next agent to route to.")
+    """Schema for the orchestrator's output - supports both single and multi-intent."""
+    # Single-intent fields
+    next_step_route: Optional[Literal["planning_agent", "team_selection_agent", "finops_agent", "answer_directly"]] = Field(None, description="The next agent to route to (single-intent only).")
     response: Optional[str] = Field(None, description="The direct response to the user, if applicable.")
+
+    # Multi-intent fields
+    is_multi_intent: bool = Field(False, description="Whether multiple distinct tasks were detected.")
+    tasks: Optional[List[TaskIntent]] = Field(None, description="List of tasks for multi-intent requests. Each task has: type, question, priority.")
     
 class BrainState(TypedDict):
     """Core state for the FlashBrain system."""
@@ -76,6 +88,11 @@ class BrainState(TypedDict):
 
     # UI messages
     ui_messages: Optional[List[BaseMessage]]
+    
+    # Multi-Intent Orchestration (v1)
+    pending_tasks: Optional[List[Dict[str, Any]]]  # [{type, question, priority, status, result}, ...]
+    current_task_idx: Optional[int]  # Index into pending_tasks for sequential execution
+    aggregated_response: Optional[str]  # Final combined response from all tasks
     
 class GeminiModel:
     def __init__(self, model_name: str, temperature: float = 0.0):
@@ -164,47 +181,71 @@ class FlashBrainAgent:
         workflow.add_node("gateway", self.gateway_router)
         workflow.add_node("orchestrator", self.orchestrator_node)
         
-        # Use the A2A wrapper node
+        # Sub-agent nodes
         workflow.add_node("planning_agent", self.planning_agent_node)
-        
         workflow.add_node("team_selection_agent", self.team_selection_node)
         workflow.add_node("finops_agent", self.finops_node)
         workflow.add_node("responder", self.response_agent_node)
+
+        # Multi-Intent Orchestration nodes (task_executor and response_aggregator only)
+        workflow.add_node("task_executor", self.task_executor_node)
+        workflow.add_node("response_aggregator", self.response_aggregator_node)
 
         # Set Entry Point
         workflow.add_edge(START, "summarize_conversation")
         workflow.add_edge("summarize_conversation", "gateway")
 
-        # Edges from Gateway
-        # 3. Define Conditional Edges
+        # Routing Functions
         def route_from_gateway(state: BrainState) -> str:
             """Route from gateway based on next_step."""
             next_step = state.get("next_step", "orchestrator")
-            
-            # Map routing decisions to actual node names
             routing_map = {
                 "orchestrator": "orchestrator",
-                "answer_directly": "responder",  # Direct answers go to responder
+                "answer_directly": "responder",
                 "planning_agent": "planning_agent",
                 "team_selection_agent": "team_selection_agent",
             }
-            
-            return routing_map.get(next_step, "orchestrator")  # Default to orchestrator if unknown
+            return routing_map.get(next_step, "orchestrator")
 
         def route_from_orchestrator(state: BrainState) -> str:
-            """Route from orchestrator based on next_step."""
+            """Route from orchestrator based on single-intent or multi-intent detection."""
+            # Check if multi-intent was detected by orchestrator
+            if state.get("pending_tasks"):
+                # Multi-intent: go to task_executor
+                return "task_executor"
+
+            # Single-intent: route to appropriate agent
             next_step = state.get("next_step", END)
-            
-            # Map orchestrator decisions to actual node names  
             routing_map = {
                 "planning_agent": "planning_agent",
                 "team_selection_agent": "team_selection_agent",
                 "finops_agent": "finops_agent",
-                "answer_directly": "responder", # Orchestrator can also decide to answer directly
+                "answer_directly": "responder",
             }
-            
-            return routing_map.get(next_step, END)  # If next_step is END or unknown, return END
+            return routing_map.get(next_step, END)
+        
+        def route_from_task_executor(state: BrainState) -> str:
+            """Route to appropriate sub-agent or aggregator."""
+            next_step = state.get("next_step")
+            if next_step == "response_aggregator":
+                return "response_aggregator"
+            # Route to sub-agents
+            routing_map = {
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+                "finops_agent": "finops_agent",
+                "responder": "responder"
+            }
+            return routing_map.get(next_step, "response_aggregator")
+        
+        def route_from_subagents(state: BrainState) -> str:
+            """Sub-agents either loop back to task_executor or go to END."""
+            next_step = state.get("next_step")
+            if next_step == "task_executor":
+                return "task_executor"
+            return END
 
+        # Edge Configuration
         workflow.add_conditional_edges(
             "gateway",
             route_from_gateway,
@@ -216,50 +257,89 @@ class FlashBrainAgent:
             }
         )
 
-        # Edges from Orchestrator
+        # Orchestrator routes based on single vs multi-intent
         workflow.add_conditional_edges(
             "orchestrator",
             route_from_orchestrator,
             {
+                "task_executor": "task_executor",
                 "planning_agent": "planning_agent",
                 "team_selection_agent": "team_selection_agent",
                 "finops_agent": "finops_agent",
-                "responder": "responder", # Orchestrator can also decide to answer directly
+                "responder": "responder",
                 END: END
             }
         )
+        
+        # Task executor routes to sub-agents or aggregator
+        workflow.add_conditional_edges(
+            "task_executor",
+            route_from_task_executor,
+            {
+                "planning_agent": "planning_agent",
+                "team_selection_agent": "team_selection_agent",
+                "finops_agent": "finops_agent",
+                "responder": "responder",
+                "response_aggregator": "response_aggregator"
+            }
+        )
+        
+        # Sub-agents loop back to task_executor or END
+        workflow.add_conditional_edges("planning_agent", route_from_subagents, 
+                                      {"task_executor": "task_executor", END: END})
+        workflow.add_conditional_edges("team_selection_agent", route_from_subagents,
+                                      {"task_executor": "task_executor", END: END})
+        workflow.add_conditional_edges("finops_agent", route_from_subagents,
+                                      {"task_executor": "task_executor", END: END})
+        workflow.add_conditional_edges("responder", route_from_subagents,
+                                      {"task_executor": "task_executor", END: END})
+        
+        # Aggregator ends
+        workflow.add_edge("response_aggregator", END)
 
-        # Edges from Sub-Agents (return to END for now, could loop back to Orchestrator)
-        workflow.add_edge("planning_agent", END)
-        workflow.add_edge("team_selection_agent", END)
-        workflow.add_edge("finops_agent", END)
-        workflow.add_edge("responder", END)
+        # Add Checkpointer for Memory - Use PostgreSQL for persistence (REQUIRED for production)
+        if not self.postgres_connection:
+            raise RuntimeError(
+                "SUPABASE_TRANSACTION_POOLER environment variable is required for production. "
+                "FlashBrain cannot run without persistent state storage."
+            )
 
-        # Add Checkpointer for Memory - Use PostgreSQL for persistence
-        if self.postgres_connection:
-            try:
-                # Use connection pool approach with autocommit to avoid transaction issues
-                from psycopg_pool import AsyncConnectionPool
-                
-                pool = AsyncConnectionPool(
-                    conninfo=self.postgres_connection,
-                    max_size=20,
-                    min_size=1,
-                    kwargs={"autocommit": True, "prepare_threshold": None},
-                    open=False  # Don't auto-open (deprecated)
-                )
-                
-                await pool.open()  # Explicitly open the pool
-                
-                checkpointer = AsyncPostgresSaver(pool)
-                await checkpointer.setup()  # Create tables (works with autocommit)
-                logger.info("AsyncPostgreSQL checkpointer initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {e}. Falling back to in-memory.")
-                checkpointer = MemorySaver()
-        else:
-            logger.warning("No SUPABASE_TRANSACTION_POOLER configured, using in-memory checkpointer")
-            checkpointer = MemorySaver()
+        try:
+            # Use connection pool approach with autocommit to avoid transaction issues
+            from psycopg_pool import AsyncConnectionPool
+
+            pool = AsyncConnectionPool(
+                conninfo=self.postgres_connection,
+                max_size=20,
+                min_size=1,
+                kwargs={
+                    "autocommit": True,
+                    "prepare_threshold": None,
+                    "connect_timeout": 10,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 5,
+                },
+                open=False,
+                timeout=30.0,  # Pool checkout timeout
+                max_waiting=10,  # Max clients waiting for a connection
+                max_idle=300.0,  # Max time a connection can stay idle (5 min)
+                reconnect_timeout=60.0,  # Time to wait before reconnecting
+            )
+
+            await pool.open()  # Explicitly open the pool
+
+            checkpointer = AsyncPostgresSaver(pool)
+            await checkpointer.setup()  # Create tables (works with autocommit)
+            logger.info("AsyncPostgreSQL checkpointer initialized successfully")
+
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to initialize PostgreSQL checkpointer: {e}", exc_info=True)
+            raise RuntimeError(
+                f"Failed to initialize PostgreSQL checkpointer. FlashBrain cannot start without persistent state. "
+                f"Error: {e}"
+            ) from e
 
         return workflow.compile(checkpointer=checkpointer)
     
@@ -355,6 +435,12 @@ class FlashBrainAgent:
         """
         Lightweight classifier to route between simple Workflow and complex Orchestrator,
         and to select the appropriate model (fast or powerful) for subsequent steps.
+        
+        Function:
+        1. Analyzes conversation history to determine complexity.
+        2. Routes simple queries to 'responder' (fast model).
+        3. Routes complex queries to 'orchestrator' (powerful model).
+        4. Calculates token usage for cost tracking.
         """
         messages = state["messages"]
         
@@ -419,8 +505,14 @@ class FlashBrainAgent:
     # --- Level 1: FlashBrain Orchestrator ---
     def orchestrator_node(self, state: BrainState) -> Dict[str, Any]:
         """
-        The central brain. Decides which reasoning subsystem to call or answers the user,
-        Multi-step orchestrator that coordinates between different specialist agents.
+        The central brain with integrated intent planning.
+        Decides which reasoning subsystem to call AND detects multi-intent requests.
+
+        Function:
+        1. Uses a powerful LLM (Gemini Pro) to analyze the user's request.
+        2. Detects if multiple distinct tasks exist (multi-intent).
+        3. For single-intent: routes to appropriate agent (planning_agent, team_selection_agent, etc.)
+        4. For multi-intent: creates pending_tasks list and routes to task_executor.
         """
 
         # Use pre-filtered messages from gateway if available, otherwise filter now
@@ -428,7 +520,7 @@ class FlashBrainAgent:
         if not recent_messages:
             messages = state["messages"]
             recent_messages = self.filter_meaningful_messages(messages, max_count=10)
-    
+
         # Use the selected model key to get the appropriate model client
         selected_model_key = state.get("selected_model_key", "powerful") # Orchestrator defaults to powerful
         orchestrator_model = self.model_clients.get(selected_model_key)
@@ -440,7 +532,7 @@ class FlashBrainAgent:
 
                 # Build message list with system prompt and conversation history
                 llm_messages = [{"role": "system", "content": ORCHESTRATOR_PROMPT}]
-                
+
                 # Add recent conversation history
                 for msg in recent_messages:
                     if isinstance(msg, HumanMessage):
@@ -450,8 +542,12 @@ class FlashBrainAgent:
 
                 response = agent.invoke(llm_messages)
 
-                # Parse the response - use correct attribute name from OrchestratorOutput
-                next_step = response.next_step_route
+                # Validate response
+                if response is None:
+                    logger.error("LLM returned None response")
+                    raise ValueError("LLM returned None response")
+
+                logger.info(f"Orchestrator response: is_multi_intent={response.is_multi_intent}, next_step={response.next_step_route}, tasks={len(response.tasks) if response.tasks else 0}")
 
                 # Calculate token usage
                 if hasattr(orchestrator_model.client, "get_num_tokens_from_messages"):
@@ -462,15 +558,41 @@ class FlashBrainAgent:
                 else:
                     token_usage = 0
 
-                return {
-                    "next_step": next_step,
-                    "last_token_usage": token_usage,
-                    "previous_step": "orchestrator",
-                    "ui_messages": [AIMessage(content="🧠 Determining next step...")]
-                }
+                # Check if multi-intent was detected
+                if response.is_multi_intent and response.tasks:
+                    # Multi-intent path: prepare tasks for execution
+                    # Convert TaskIntent objects to dicts for state storage
+                    tasks = [task.model_dump() for task in response.tasks]
+                    logger.info(f"Multi-intent detected. Tasks from LLM: {tasks}")
+
+                    # Sort tasks by priority (lower number = higher priority)
+                    tasks_sorted = sorted(tasks, key=lambda x: x.get("priority", 999))
+
+                    # Initialize task tracking (fields already validated by Pydantic)
+                    for task in tasks_sorted:
+                        task["status"] = "pending"
+                        task["result"] = None
+
+                    return {
+                        "pending_tasks": tasks_sorted,
+                        "current_task_idx": 0,
+                        "last_token_usage": token_usage,
+                        "previous_step": "orchestrator",
+                        "ui_messages": [AIMessage(content=f"📋 Detected {len(tasks_sorted)} tasks to complete...")]
+                    }
+                else:
+                    # Single-intent path: route to appropriate agent
+                    next_step = response.next_step_route
+
+                    return {
+                        "next_step": next_step,
+                        "last_token_usage": token_usage,
+                        "previous_step": "orchestrator",
+                        "ui_messages": [AIMessage(content="🧠 Determining next step...")]
+                    }
 
             except Exception as e:
-                print(f"Orchestrator LLM execution failed ({e}), falling back to heuristic. Error: {e}")
+                logger.error(f"Orchestrator LLM execution failed ({e}), falling back to heuristic. Error: {e}")
 
         # Fallback heuristic (if LLM fails or is unavailable)
         return {
@@ -479,17 +601,142 @@ class FlashBrainAgent:
             "last_token_usage": 0,
             "previous_step": "orchestrator"
         }
+
+    # --- Multi-Intent Orchestration Nodes ---
+
+    def task_executor_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Phase 2: Sequential Task Execution
+        Routes to the appropriate sub-agent based on the current task.
+
+        Function:
+        1. Checks `current_task_idx` against `pending_tasks`.
+        2. If tasks remain, retrieves the current task type.
+        3. Maps task type to the correct agent node (e.g., PROJECT_DECOMP -> planning_agent).
+        4. Updates `next_step` to route to that agent.
+        5. If all tasks done, routes to `response_aggregator`.
+        """
+        pending_tasks = state.get("pending_tasks", [])
+        current_idx = state.get("current_task_idx", 0)
+
+        logger.info(f"[TASK_EXECUTOR] Current index: {current_idx}, Total tasks: {len(pending_tasks)}")
+
+        # Check if all tasks are complete
+        if current_idx >= len(pending_tasks):
+            logger.info(f"[TASK_EXECUTOR] All tasks complete. Routing to response_aggregator")
+            return {"next_step": "response_aggregator"}
+
+        # Get current task
+        current_task = pending_tasks[current_idx]
+        logger.info(f"[TASK_EXECUTOR] Current task: {current_task}")
+
+        task_type = current_task.get("type")
+        task_question = current_task.get("question", "Unknown")
+
+        # Validate task has required fields
+        if not task_type:
+            logger.error(f"[TASK_EXECUTOR] Task missing 'type' field: {current_task}")
+            raise ValueError(f"Task {current_idx} missing 'type' field")
+        if not current_task.get("question"):
+            logger.error(f"[TASK_EXECUTOR] Task missing 'question' field: {current_task}")
+            raise ValueError(f"Task {current_idx} missing 'question' field")
+
+        # Route based on task type
+        route_map = {
+            "PROJECT_DECOMP": "planning_agent",
+            "SELECT_FREELANCER": "team_selection_agent",
+            "FINOPS": "finops_agent",
+            "DIRECT_ANSWER": "responder"
+        }
+
+        next_step = route_map.get(task_type, "responder")
+        logger.info(f"[TASK_EXECUTOR] Routing task {current_idx + 1}/{len(pending_tasks)} (type={task_type}) to {next_step}")
+
+        return {
+            "next_step": next_step,
+            "ui_messages": [AIMessage(content=f"⚙️ Processing task {current_idx + 1}/{len(pending_tasks)}: {task_question}")]
+        }
+
+    def response_aggregator_node(self, state: BrainState) -> Dict[str, Any]:
+        """
+        Phase 3: Response Aggregation
+        Combines results from all completed tasks into a unified response.
         
+        Function:
+        1. Collects results from all items in `pending_tasks`.
+        2. Formats them into a single readable message (Task 1: ... Result: ...).
+        3. Updates `aggregated_response` in state.
+        4. Returns the final combined message to the user.
+        """
+        pending_tasks = state.get("pending_tasks", [])
+
+        if not pending_tasks:
+            return {
+                "messages": [AIMessage(content="No tasks to aggregate.")],
+                "next_step": END
+            }
+
+        # Simple concatenation (v1 approach)
+        aggregated_parts = []
+        for i, task in enumerate(pending_tasks):
+            question = task.get("question", "Unknown task")
+            result = task.get("result", "No result available")
+
+            aggregated_parts.append(f"**Task {i + 1}**: {question}\n\n{result}")
+
+        aggregated_response = "\n\n---\n\n".join(aggregated_parts)
+
+        return {
+            "messages": [AIMessage(content=aggregated_response)],
+            "aggregated_response": aggregated_response,
+            "next_step": END,
+            "previous_step": "response_aggregator"
+        }
+
     def response_agent_node(self, state: BrainState) -> Dict[str, Any]:
         """
         Answers the user's query directly with streaming output.
-        LangGraph's messages mode will automatically stream LLM tokens.
+        Enhanced for multi-intent support.
+
+        Function:
+        1. Acts as a general-purpose chatbot for direct questions.
+        2. Supports both single-intent (uses conversation history) and multi-intent (uses specific task question).
+        3. Streams the LLM response back to the user.
+        4. Stores the result in `pending_tasks` if in multi-intent mode.
         """
-        # Use pre-filtered messages from gateway if available
-        recent_messages = state.get("short_conversation_history")
-        if not recent_messages:
-            messages = state["messages"]
-            recent_messages = self.filter_meaningful_messages(messages, max_count=10)
+        pending_tasks = state.get("pending_tasks")
+        current_idx = state.get("current_task_idx")
+
+        logger.info(f"[RESPONDER] Multi-intent mode: {pending_tasks is not None and current_idx is not None}")
+
+        # For multi-intent, use task question directly
+        if pending_tasks and current_idx is not None:
+            logger.info(f"[RESPONDER] Multi-intent: Processing task {current_idx + 1}/{len(pending_tasks)}")
+            try:
+                user_question = pending_tasks[current_idx]["question"]
+                logger.info(f"[RESPONDER] Task question: {user_question}")
+            except KeyError as e:
+                logger.error(f"[RESPONDER] Task missing 'question' field. Task: {pending_tasks[current_idx]}")
+                raise ValueError(f"Task {current_idx} missing 'question' field") from e
+
+            # Create simple message list for direct answer
+            llm_messages = [
+                {"role": "system", "content": RESPONSE_AGENT_PROMPT},
+                {"role": "user", "content": user_question}
+            ]
+        else:
+            # Single-intent: use full conversation history
+            recent_messages = state.get("short_conversation_history")
+            if not recent_messages:
+                messages = state["messages"]
+                recent_messages = self.filter_meaningful_messages(messages, max_count=10)
+            
+            llm_messages = [{"role": "system", "content": RESPONSE_AGENT_PROMPT}]
+            for msg in recent_messages:
+                if isinstance(msg, HumanMessage):
+                    llm_messages.append({"role": "user", "content": msg.content})
+                elif isinstance(msg, AIMessage):
+                    llm_messages.append({"role": "assistant", "content": msg.content})
 
         # Use the selected model key to get the appropriate model client
         selected_model_key = state.get("selected_model_key", "fast")
@@ -497,22 +744,24 @@ class FlashBrainAgent:
 
         if response_model:
             try:
-                # Build message list with conversation history
-                llm_messages = [{"role": "system", "content": RESPONSE_AGENT_PROMPT}]
-                
-                for msg in recent_messages:
-                    if isinstance(msg, HumanMessage):
-                        llm_messages.append({"role": "user", "content": msg.content})
-                    elif isinstance(msg, AIMessage):
-                        llm_messages.append({"role": "assistant", "content": msg.content})
-                
-                # Use .stream() - LangGraph will capture and emit these tokens in messages mode
+                # Stream response
                 full_response = ""
                 for chunk in response_model.client.stream(llm_messages):
                     if hasattr(chunk, 'content') and chunk.content:
                         full_response += chunk.content
 
-                # Return the complete response in messages
+                # Multi-intent: store result and advance
+                if pending_tasks and current_idx is not None:
+                    pending_tasks[current_idx]["status"] = "completed"
+                    pending_tasks[current_idx]["result"] = full_response
+                    
+                    return {
+                        "pending_tasks": pending_tasks,
+                        "current_task_idx": current_idx + 1,
+                        "next_step": "task_executor"
+                    }
+                
+                # Single-intent: return normally
                 return {
                     "messages": [AIMessage(content=full_response)],
                     "next_step": END,
@@ -521,17 +770,36 @@ class FlashBrainAgent:
 
             except Exception as e:
                 logger.error(f"Response agent LLM execution failed ({e}), falling back to error message.")
-                error_msg = AIMessage(content="I'm sorry, I encountered an error. Please try again.")
+                error_msg = "I'm sorry, I encountered an error. Please try again."
+                
+                if pending_tasks and current_idx is not None:
+                    pending_tasks[current_idx]["status"] = "completed"
+                    pending_tasks[current_idx]["result"] = error_msg
+                    return {
+                        "pending_tasks": pending_tasks,
+                        "current_task_idx": current_idx + 1,
+                        "next_step": "task_executor"
+                    }
+                
                 return {
-                    "messages": [error_msg],
+                    "messages": [AIMessage(content=error_msg)],
                     "next_step": END,
                     "previous_step": "response_agent"
                 }
         
         # Fallback if no model available
-        error_msg = AIMessage(content="Response model not available.")
+        error_msg = "Response model not available."
+        if pending_tasks and current_idx is not None:
+            pending_tasks[current_idx]["status"] = "completed"
+            pending_tasks[current_idx]["result"] = error_msg
+            return {
+                "pending_tasks": pending_tasks,
+                "current_task_idx": current_idx + 1,
+                "next_step": "task_executor"
+            }
+        
         return {
-            "messages": [error_msg],
+            "messages": [AIMessage(content=error_msg)],
             "next_step": END,
             "previous_step": "response_agent"
         }
@@ -542,12 +810,34 @@ class FlashBrainAgent:
     async def planning_agent_node(self, state: BrainState) -> Dict[str, Any]:
         """
         Calls the external Planning Agent via A2A protocol HTTP endpoint.
-        Collects all streaming updates and returns them together.
-        
-        Note: This collects messages because LangGraph's stream_mode='updates' 
-        doesn't capture intermediate yields from generator nodes.
+        Enhanced for multi-intent support.
+
+        Function:
+        1. Connects to the Project Decomposition Agent service.
+        2. Sends the user's request (or specific task question) to decompose a project.
+        3. Streams the agent's progress and final result.
+        4. Stores the result in `pending_tasks` if in multi-intent mode.
         """
-        last_msg_content = state["messages"][-1].content
+        pending_tasks = state.get("pending_tasks")
+        current_idx = state.get("current_task_idx")
+
+        logger.info(f"[PLANNING_AGENT] Multi-intent mode: {pending_tasks is not None and current_idx is not None}")
+
+        # Determine input message
+        if pending_tasks and current_idx is not None:
+            # Multi-intent mode: use current task's question
+            logger.info(f"[PLANNING_AGENT] Multi-intent: Processing task {current_idx + 1}/{len(pending_tasks)}")
+            try:
+                message = pending_tasks[current_idx]["question"]
+                logger.info(f"[PLANNING_AGENT] Task question: {message}")
+            except KeyError as e:
+                logger.error(f"[PLANNING_AGENT] Task missing 'question' field. Task: {pending_tasks[current_idx]}")
+                raise ValueError(f"Task {current_idx} missing 'question' field") from e
+        else:
+            # Single-intent mode: use last message
+            message = state["messages"][-1].content
+            logger.info(f"[PLANNING_AGENT] Single-intent mode. Message: {message}")
+        
         agent_url = os.getenv("PROJECT_DECOMP_AGENT_URL", "http://localhost:8011")
 
         # Collect all streaming updates from the A2A agent
@@ -556,7 +846,7 @@ class FlashBrainAgent:
         
         async for response_text in call_project_decomp_agent(
             agent_url=agent_url,
-            message=last_msg_content,
+            message=message,
             project_id=state.get("project_id"),
             client_id=state.get("client_id"),
             exist=False,
@@ -565,7 +855,18 @@ class FlashBrainAgent:
             all_updates.append(response_text)
             final_response = response_text
 
-        # Return all updates as a single message
+        # Multi-intent: store result and advance
+        if pending_tasks and current_idx is not None:
+            pending_tasks[current_idx]["status"] = "completed"
+            pending_tasks[current_idx]["result"] = final_response
+            
+            return {
+                "pending_tasks": pending_tasks,
+                "current_task_idx": current_idx + 1,
+                "next_step": "task_executor"  # Loop back
+            }
+        
+        # Single-intent: return normally
         combined_message = "\n".join(all_updates)
         return {
             "messages": [AIMessage(content=combined_message)],
@@ -576,12 +877,23 @@ class FlashBrainAgent:
     async def team_selection_node(self, state: BrainState) -> Dict[str, Any]:
         """
         Calls the external Select Freelancer Agent via A2A protocol HTTP endpoint.
-        Collects all streaming updates and returns them together.
+        Enhanced for multi-intent support.
         
-        Note: This collects messages because LangGraph's stream_mode='updates' 
-        doesn't capture intermediate yields from generator nodes.
+        Function:
+        1. Connects to the Select Freelancer Agent service.
+        2. Sends the request to find freelancers matching project requirements.
+        3. Streams the search process and results.
+        4. Stores the result in `pending_tasks` if in multi-intent mode.
         """
-        last_msg_content = state["messages"][-1].content
+        pending_tasks = state.get("pending_tasks")
+        current_idx = state.get("current_task_idx")
+        
+        # Determine input message
+        if pending_tasks and current_idx is not None:
+            message = pending_tasks[current_idx]["question"]
+        else:
+            message = state["messages"][-1].content
+        
         agent_url = os.getenv("SELECT_FREELANCER_AGENT_URL", "http://localhost:8012")
 
         # Collect all streaming updates from the A2A agent
@@ -590,14 +902,25 @@ class FlashBrainAgent:
         
         async for response_text in call_freelancer_agent(
             agent_url=agent_url,
-            message=last_msg_content,
+            message=message,
             project_id=state.get("project_id"),
             client_id=state.get("client_id", "default")
         ):
             all_updates.append(response_text)
             final_response = response_text
 
-        # Create AgentResponse object for metadata
+        # Multi-intent: store result and advance
+        if pending_tasks and current_idx is not None:
+            pending_tasks[current_idx]["status"] = "completed"
+            pending_tasks[current_idx]["result"] = final_response
+            
+            return {
+                "pending_tasks": pending_tasks,
+                "current_task_idx": current_idx + 1,
+                "next_step": "task_executor"
+            }
+        
+        # Single-intent: create AgentResponse object for metadata
         agent_response = AgentResponse(
             status="success",
             data={"response": final_response},
@@ -615,16 +938,39 @@ class FlashBrainAgent:
             "next_step": END
         }
 
-    # 2c. FinOps Agent (Code Sandbox)  # TODO: Not sure what to do here yet, need to discuss with Nisi. 
+    # 2c. FinOps Agent (Code Sandbox)
     def finops_node(self, state: BrainState) -> Dict[str, Any]:
         """
         Executes Python/SQL for math. Never uses raw LLM for calculation.
+        Enhanced for multi-intent support.
+        
+        Function:
+        1. Performs deterministic financial calculations (budget, runway, burn rate).
+        2. Currently a simulation/placeholder for demonstration.
+        3. Returns structured financial data.
         """
+        pending_tasks = state.get("pending_tasks")
+        current_idx = state.get("current_task_idx")
+        
         # Simulation: Run python calculation
         budget = 50000
         burn_rate = 5000
         runway = budget / burn_rate
         
+        msg = f"Based on the data, you have {runway} months of runway left."
+        
+        # Multi-intent: store result and advance
+        if pending_tasks and current_idx is not None:
+            pending_tasks[current_idx]["status"] = "completed"
+            pending_tasks[current_idx]["result"] = msg
+            
+            return {
+                "pending_tasks": pending_tasks,
+                "current_task_idx": current_idx + 1,
+                "next_step": "task_executor"
+            }
+        
+        # Single-intent: return normally
         response = AgentResponse(
             status="success",
             data={"forecast_months": runway, "burn_rate": burn_rate},
@@ -634,7 +980,6 @@ class FlashBrainAgent:
             )
         )
         
-        msg = f"Based on the data, you have {runway} months of runway left."
         return {
             "messages": [AIMessage(content=msg)],
             "last_agent_response": response.model_dump(),
@@ -646,6 +991,10 @@ class FlashBrainAgent:
     def basic_tools_node(self, state: BrainState) -> Dict[str, Any]:
         """
         Executes simple deterministic actions via tools.
+        
+        Function:
+        1. Placeholder for future tool execution node.
+        2. Would handle simple, non-agentic tools (e.g., search, calculator).
         """
         # In a real graph, this would call ToolNode(WORKFLOW_TOOLS)
         # Here we simulate a successful tool call.
@@ -659,6 +1008,11 @@ class FlashBrainAgent:
         """
         Summarizes the conversation if the PREVIOUS model run exceeded a token limit.
         Calls the external Summarization Agent via A2A HTTP endpoint.
+        
+        Function:
+        1. Checks `last_token_usage` against a threshold (20k tokens).
+        2. If exceeded, calls the Summarization Agent to condense history.
+        3. Replaces old messages with a summary to free up context window.
         """
         messages = state["messages"]
         last_token_usage = state.get("last_token_usage", 0)
@@ -895,3 +1249,4 @@ if __name__ == "__main__":
     #port = int(os.getenv("PORT", 8010))
     #print(f"Starting FlashBrain Orchestrator on port {port}...")
     #run_server(FlashBrainAgent(), port=port)
+

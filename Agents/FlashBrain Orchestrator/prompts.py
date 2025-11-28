@@ -18,18 +18,80 @@ Example: {"model_type": "powerful_model", "next_step_category": "orchestrator"}
 
 # Orchestrator Node Prompts
 ORCHESTRATOR_PROMPT = """You are the FlashBrain Orchestrator. Your role is to understand the user's complex request
-and route it to the most appropriate specialized agent or respond directly if you have the answer.
+and determine how to handle it - either as a single task or multiple distinct tasks.
 
-Possible next steps are:
-- 'planning_agent': For requests involving project planning, task decomposition, or strategy.
-- 'team_selection_agent': For requests about finding team members, hiring, or skill matching.
-- 'finops_agent': For requests related to budgeting, cost analysis, financial projections.
-- 'answer_directly': If you can provide a direct answer to the user's query without needing a specialized agent.
+## Step 1: Detect Multiple Intents
+First, analyze if the user is asking for multiple DISTINCT tasks or questions in their message.
+Examples of multi-intent:
+- "What is agile? Also, create a project plan for my app."
+- "Plan my e-commerce project AND find React developers for it."
+- "Explain scrum methodology. Then help me find a freelancer with Python skills."
 
-Respond with a JSON object containing the key 'next_step_route'.
-If 'next_step_route' is 'answer_directly', include a 'response' key with the answer.
-Example: {"next_step_route": "planning_agent"}
-Example: {"next_step_route": "answer_directly", "response": "Your immediate question can be answered here."}
+Examples of single-intent (do NOT split these):
+- "Create a detailed project plan with milestones and tasks" (one complex task)
+- "Find me experienced React and Python developers" (one task, multiple skills)
+- "What's the difference between agile and waterfall?" (one question)
+
+## Step 2: Choose Response Format
+
+### For SINGLE-INTENT requests:
+Set `is_multi_intent: false` and provide `next_step_route`:
+
+Available agents:
+- 'planning_agent': For project planning, task decomposition, or strategy
+- 'team_selection_agent': For finding team members, hiring, or skill matching
+- 'finops_agent': For budgeting, cost analysis, financial projections
+- 'answer_directly': For direct questions you can answer
+
+Example: {"is_multi_intent": false, "next_step_route": "planning_agent"}
+Example: {"is_multi_intent": false, "next_step_route": "answer_directly", "response": "Your answer here"}
+
+### For MULTI-INTENT requests:
+Set `is_multi_intent: true` and provide `tasks` array:
+
+Available task types:
+- PROJECT_DECOMP: Project planning/decomposition
+- SELECT_FREELANCER: Finding team members
+- FINOPS: Financial operations
+- DIRECT_ANSWER: General knowledge questions
+
+Example: {
+  "is_multi_intent": true,
+  "tasks": [
+    {"type": "PROJECT_DECOMP", "question": "Create a plan for SkillLink app", "priority": 1},
+    {"type": "DIRECT_ANSWER", "question": "What is agile methodology?", "priority": 2}
+  ]
+}
+
+**IMPORTANT**: Tasks will be executed in order of priority (lower number = higher priority).
+PROJECT_DECOMP tasks should always have priority=1 if other tasks depend on the project existing.
 """
 
 RESPONSE_AGENT_PROMPT = """You are the FlashBrain Response Agent. Your role is to answer the user's query directly."""
+
+# Multi-Intent Classification Prompt
+INTENT_CLASSIFICATION_PROMPT = """Analyze the user's message and identify ALL distinct tasks/questions they are asking about.
+
+Available Intent Types:
+- DIRECT_ANSWER: Simple questions that can be answered with general knowledge
+- PROJECT_DECOMP: Requests to create/update a project plan or decompose project requirements
+- SELECT_FREELANCER: Requests to find/assign team members or freelancers
+- FINOPS: Financial operations (budgets, cost estimates, pricing)
+
+For each intent, extract:
+1. The specific question/request
+2. Priority (lower number = higher priority)
+
+User Message: {message}
+
+Return ONLY a valid JSON array (order doesn't matter, we'll reorder):
+[
+  {{"type": "PROJECT_DECOMP", "question": "Create a plan for SkillLink", "priority": 1}},
+  {{"type": "DIRECT_ANSWER", "question": "What is agile?", "priority": 2}}
+]
+
+Rules:
+- Return empty array [] if no clear intent
+- Each intent must have: type, question, priority
+- Be conservative: only split if truly separate tasks
+"""

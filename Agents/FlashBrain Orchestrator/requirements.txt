@@ -8,6 +8,7 @@ pydantic>=2.0.0
 # PostgreSQL State Persistence
 langgraph-checkpoint-postgres>=1.0.0  # PostgreSQL checkpointer for LangGraph
 psycopg[binary]>=3.1.0  # PostgreSQL adapter
+psycopg-pool>=3.1.0  # Connection pool for psycopg
 
 # LangChain and LangGraph
 langgraph>=1.0.3
