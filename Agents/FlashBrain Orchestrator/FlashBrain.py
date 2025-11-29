@@ -322,26 +322,28 @@ class FlashBrainAgent:
             # Use connection pool approach with autocommit to avoid transaction issues
             from psycopg_pool import AsyncConnectionPool
 
+            # Cloud Run serverless optimized settings
+            # Small pool per instance since Cloud Run auto-scales instances
             pool = AsyncConnectionPool(
                 conninfo=self.postgres_connection,
-                max_size=10,  # Reduced to prevent pool exhaustion
-                min_size=2,   # Keep warm connections ready
+                max_size=2,   # Very small for Cloud Run (2-3 per instance max)
+                min_size=0,   # Start with 0, create on demand (faster cold starts)
                 kwargs={
                     "autocommit": True,
                     "prepare_threshold": None,
-                    "connect_timeout": 10,
+                    "connect_timeout": 20,  # Longer for Cloud Run → Supabase latency
                     "keepalives": 1,
-                    "keepalives_idle": 10,  # Check health every 10s (faster detection)
-                    "keepalives_interval": 5,  # Probe every 5s if connection is suspect
-                    "keepalives_count": 3,  # Fail after 3 missed probes (15s total)
+                    "keepalives_idle": 10,
+                    "keepalives_interval": 5,
+                    "keepalives_count": 3,
                 },
                 open=False,
-                timeout=10.0,  # Fail faster if pool is stuck
-                max_waiting=5,  # Limit queue buildup
-                max_idle=60.0,  # Recycle idle connections after 1 min
-                reconnect_timeout=5.0,  # Reconnect faster on failure
-                check=AsyncConnectionPool.check_connection,  # Enable connection health checks
-                reset=False,  # Don't reset connections (they're autocommit anyway)
+                timeout=20.0,  # Longer checkout timeout for Cloud Run
+                max_waiting=2,  # Small queue (fail fast - Cloud Run will scale instances)
+                max_idle=30.0,  # Recycle quickly in serverless
+                reconnect_timeout=10.0,
+                check=AsyncConnectionPool.check_connection,
+                reset=False,
             )
 
             await pool.open()  # Explicitly open the pool

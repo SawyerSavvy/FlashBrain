@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-async def setup_client(httpx_client: httpx.AsyncClient, base_url: str = "http://localhost:8010"):
+async def setup_client(httpx_client: httpx.AsyncClient, base_url: str = "https://flashbrain-orchestrator-935893169019.us-central1.run.app"):
     """Initialize A2A client with proper agent card resolution."""
     # Initialize A2ACardResolver
     resolver = A2ACardResolver(
@@ -75,7 +75,6 @@ async def print_responses(iterator):
                         print(f"[message] {text}")
                         full_response += text
     return full_response
-
 
 async def test_single_intent(httpx_client: httpx.AsyncClient):
     """Test backward compatibility with single-intent messages."""
@@ -138,8 +137,8 @@ async def test_multi_intent(httpx_client: httpx.AsyncClient):
     }
     message = Message(**message_data)
 
-    #response = await print_responses(client.send_message(message))
-    #print(f"\n✅ Multi-intent test completed. Response length: {len(response)} chars")
+    response = await print_responses(client.send_message(message))
+    print(f"\n✅ Multi-intent test completed. Response length: {len(response)} chars")
 
 
 async def test_decomp_then_freelancer(httpx_client: httpx.AsyncClient):
