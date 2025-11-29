@@ -112,6 +112,7 @@ async def call_project_decomp_agent(
     message: str,
     project_id: Optional[str] = None,
     client_id: Optional[str] = None,
+    job_id: Optional[str] = None,
     exist: bool = False,
     context_id: str = "default"
 ):
@@ -123,6 +124,7 @@ async def call_project_decomp_agent(
         message: User message
         project_id: Project ID
         client_id: Client ID
+        job_id: Job ID from orchestrator (for async tracking)
         exist: Whether the project already exists
         context_id: Context ID
 
@@ -156,6 +158,7 @@ async def call_project_decomp_agent(
                 'metadata': {
                     'project_id': project_id,
                     'client_id': client_id,
+                    'job_id': job_id,
                     'exist': exist
                 }
             }

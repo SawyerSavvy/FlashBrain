@@ -64,6 +64,7 @@ class ProjectDecompAgentExecutor(AgentExecutor):
             # Extract additional parameters from message metadata if available
             project_id = None
             client_id = None
+            job_id = None
             exist = False
 
             if hasattr(context, 'message') and context.message:
@@ -71,6 +72,7 @@ class ProjectDecompAgentExecutor(AgentExecutor):
                 if metadata:
                     project_id = metadata.get('project_id')
                     client_id = metadata.get('client_id')
+                    job_id = metadata.get('job_id')
                     exist = metadata.get('exist', False)
 
             # Stream responses from the agent
@@ -79,6 +81,7 @@ class ProjectDecompAgentExecutor(AgentExecutor):
                 context_id=task.context_id,
                 project_id=project_id,
                 client_id=client_id,
+                job_id=job_id,
                 exist=exist
             ):
                 is_task_complete = item.get('is_task_complete', False)

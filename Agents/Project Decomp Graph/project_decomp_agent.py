@@ -2,6 +2,7 @@ from typing import Annotated, List, Literal, Optional, TypedDict, Union, Dict, A
 
 import os
 import time
+import logging
 
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
@@ -18,11 +19,14 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+logger = logging.getLogger(__name__)
+
 # Define the state for this subgraph
 class ProjectDecompState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages] #Conversation history
     project_id: Optional[str] #Project_id value
     client_id: Optional[str] #Client_id value
+    job_id: Optional[str] #Job ID from FlashBrain orchestrator for async tracking
     exist: Optional[bool] #Project_id exists
     extracted_info: Optional[str] #History to send to A2A
     orchestrator_response: Optional[str] #Response from the A2A 
@@ -95,10 +99,12 @@ class ProjectDecompAgent:
     # --- Node 1.5: Upload to Supabase ---
     def upload_to_supabase(self, state: ProjectDecompState) -> Dict[str, Any]:
         """
-        Uploads the extracted summary to Supabase.
+        Uploads the extracted summary and job_id to Supabase.
+        This ensures the webhook can send job_id back to the orchestrator when the project completes.
         """
         extracted_info = state.get("extracted_info", {})
         summary = extracted_info.get("summary", "")
+        job_id = state.get("job_id")
         
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -109,10 +115,16 @@ class ProjectDecompAgent:
         try:
             supabase: Client = create_client(supabase_url, supabase_key)
             
-            # Insert into Project_Decomposition table
+            # Update Project_Decomposition table with summary AND job_id
             data = {
                 "input": summary,
             }
+            
+            # Add job_id if provided (for async orchestration tracking)
+            if job_id:
+                data["job_id"] = job_id
+                logger.info(f"Saving job_id {job_id} to project_decomposition table for project {state['project_id']}")
+            
             response = supabase.table("project_decomposition").update(data).eq("project_id", state["project_id"]).execute()
 
             return {"messages": [SystemMessage(content="Successfully uploaded to Supabase.")]}
@@ -179,9 +191,17 @@ class ProjectDecompAgent:
                 "orchestrator_response": f"Error: {e}"
             }
 
-    async def stream(self, query: str, context_id: str = "default", project_id: str = None, client_id: str = None, exist: bool = False):
+    async def stream(self, query: str, context_id: str = "default", project_id: str = None, client_id: str = None, job_id: str = None, exist: bool = False):
         """
         Streams responses from the Project Decomposition Graph for A2A protocol.
+
+        Args:
+            query: User's project description
+            context_id: Conversation context ID
+            project_id: Project ID (if existing project)
+            client_id: Client ID for authentication
+            job_id: Job ID from FlashBrain orchestrator (for async tracking)
+            exist: Whether the project already exists
 
         Yields:
             Dict with keys:
@@ -194,6 +214,7 @@ class ProjectDecompAgent:
             "messages": messages,
             "project_id": project_id,
             "client_id": client_id,
+            "job_id": job_id,
             "exist": exist
         }
         
@@ -261,7 +282,7 @@ class ProjectDecompAgent:
                 'content': f"An error occurred during project decomposition: {str(e)}"
             }
 
-    def invoke(self, query: str, project_id: str, client_id: str = None, exist: bool = False) -> Dict[str, Any]:
+    def invoke(self, query: str, project_id: str, client_id: str = None, job_id: str = None, exist: bool = False) -> Dict[str, Any]:
         """
         Invokes the Project Decomposition Graph.
         """
@@ -273,6 +294,7 @@ class ProjectDecompAgent:
                     query = parsed.get("query", query)
                     project_id = parsed.get("project_id", project_id)
                     client_id = parsed.get("client_id", client_id)
+                    job_id = parsed.get("job_id", job_id)
                     exist = parsed.get("exist", exist)
             except:
                 pass
@@ -282,6 +304,7 @@ class ProjectDecompAgent:
             "messages": messages,
             "project_id": project_id,
             "client_id": client_id,
+            "job_id": job_id,
             "exist": exist
         }
         result = self.graph.invoke(state)

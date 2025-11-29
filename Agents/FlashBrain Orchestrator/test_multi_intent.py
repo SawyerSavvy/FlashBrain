@@ -98,7 +98,7 @@ async def test_single_intent(httpx_client: httpx.AsyncClient):
         'message_id': uuid4().hex,
         'metadata': {
             'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
-            'user_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
+            'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
         }
     }
     message = Message(**message_data)
@@ -133,13 +133,13 @@ async def test_multi_intent(httpx_client: httpx.AsyncClient):
         'message_id': uuid4().hex,
         'metadata': {
             'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
-            'user_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
+            'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
         }
     }
     message = Message(**message_data)
 
-    response = await print_responses(client.send_message(message))
-    print(f"\n✅ Multi-intent test completed. Response length: {len(response)} chars")
+    #response = await print_responses(client.send_message(message))
+    #print(f"\n✅ Multi-intent test completed. Response length: {len(response)} chars")
 
 
 async def test_decomp_then_freelancer(httpx_client: httpx.AsyncClient):
@@ -151,7 +151,7 @@ async def test_decomp_then_freelancer(httpx_client: httpx.AsyncClient):
     # Use proper UUIDs for context_id
     context_id = str(uuid4())
 
-    message_text = "Create a project plan for an e-commerce website and then find React developers for it."
+    message_text = "Create a project plan for an e-commerce website. Then verify that the freelancers have accounting skills."
 
     message_data = {
         'role': 'user',
@@ -165,7 +165,7 @@ async def test_decomp_then_freelancer(httpx_client: httpx.AsyncClient):
         'message_id': uuid4().hex,
         'metadata': {
             'project_id': '058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc',
-            'user_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
+            'client_id': '9a76be62-0d44-4a34-913d-08dcac008de5'
         }
     }
     message = Message(**message_data)

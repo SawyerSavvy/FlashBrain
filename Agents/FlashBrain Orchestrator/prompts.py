@@ -95,3 +95,14 @@ Rules:
 - Each intent must have: type, question, priority
 - Be conservative: only split if truly separate tasks
 """
+
+# Async Job Orchestration - Pending Job Context
+PENDING_JOB_CONTEXT_TEMPLATE = """
+IMPORTANT CONTEXT: There is currently a long-running project plan being created (Project ID: {project_id}). 
+This job was started earlier and typically takes about 5 minutes to complete.
+
+When analyzing the user's new message, consider:
+- If they're asking about the status of this pending project, respond with answer_directly and tell them it's still in progress.
+- If their new task/question DEPENDS on the project plan being complete (e.g., "find freelancers for that project"), respond with answer_directly and explain they need to wait.
+- If their new task/question is COMPLETELY UNRELATED (e.g., "what is agile?"), you can process it normally.
+"""

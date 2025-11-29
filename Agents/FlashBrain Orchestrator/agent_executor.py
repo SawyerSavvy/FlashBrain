@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 class FlashBrainAgentExecutor(AgentExecutor):
     """FlashBrain Orchestrator AgentExecutor."""
 
-    def __init__(self):
-        self.agent = FlashBrainAgent()
+    def __init__(self, agent: FlashBrainAgent = None):
+        self.agent = agent or FlashBrainAgent()
 
     async def execute(
         self,

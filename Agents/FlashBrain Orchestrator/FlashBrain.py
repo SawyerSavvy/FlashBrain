@@ -10,13 +10,14 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.prompts import ChatPromptTemplate
 import asyncio
 import json
 
-from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT, INTENT_CLASSIFICATION_PROMPT
+from prompts import GATEWAY_ROUTER_PROMPT, ORCHESTRATOR_PROMPT, RESPONSE_AGENT_PROMPT, INTENT_CLASSIFICATION_PROMPT, PENDING_JOB_CONTEXT_TEMPLATE
 # --- A2A Integration ---
 from a2a_client_helper import call_project_decomp_agent, call_freelancer_agent, call_summarization_agent
 
@@ -93,6 +94,11 @@ class BrainState(TypedDict):
     pending_tasks: Optional[List[Dict[str, Any]]]  # [{type, question, priority, status, result}, ...]
     current_task_idx: Optional[int]  # Index into pending_tasks for sequential execution
     aggregated_response: Optional[str]  # Final combined response from all tasks
+    
+    # Async Job Orchestration (for long-running tasks)
+    waiting_for_project_id: Optional[str]  # Project ID we're waiting for (from project_decomposition table)
+    suspended_tasks: Optional[List[Dict[str, Any]]]  # Tasks paused waiting for dependency
+    active_job_id: Optional[str]  # Current job ID in brain_jobs table
     
 class GeminiModel:
     def __init__(self, model_name: str, temperature: float = 0.0):
@@ -187,9 +193,11 @@ class FlashBrainAgent:
         workflow.add_node("finops_agent", self.finops_node)
         workflow.add_node("responder", self.response_agent_node)
 
-        # Multi-Intent Orchestration nodes (task_executor and response_aggregator only)
+        # Multi-Intent Orchestration nodes
         workflow.add_node("task_executor", self.task_executor_node)
-        workflow.add_node("response_aggregator", self.response_aggregator_node)
+        
+        # Async Job Orchestration node
+        workflow.add_node("check_dependency", self.check_dependency_node)
 
         # Set Entry Point
         workflow.add_edge(START, "summarize_conversation")
@@ -209,6 +217,11 @@ class FlashBrainAgent:
 
         def route_from_orchestrator(state: BrainState) -> str:
             """Route from orchestrator based on single-intent or multi-intent detection."""
+            # Check if this is a resume signal (job completion callback)
+            messages = state.get("messages", [])
+            if messages and messages[-1].content == "JOB_COMPLETE_SIGNAL":
+                return "check_dependency"
+            
             # Check if multi-intent was detected by orchestrator
             if state.get("pending_tasks"):
                 # Multi-intent: go to task_executor
@@ -225,10 +238,9 @@ class FlashBrainAgent:
             return routing_map.get(next_step, END)
         
         def route_from_task_executor(state: BrainState) -> str:
-            """Route to appropriate sub-agent or aggregator."""
+            """Route to appropriate sub-agent or END"""
             next_step = state.get("next_step")
-            if next_step == "response_aggregator":
-                return "response_aggregator"
+
             # Route to sub-agents
             routing_map = {
                 "planning_agent": "planning_agent",
@@ -236,7 +248,7 @@ class FlashBrainAgent:
                 "finops_agent": "finops_agent",
                 "responder": "responder"
             }
-            return routing_map.get(next_step, "response_aggregator")
+            return routing_map.get(next_step, END)
         
         def route_from_subagents(state: BrainState) -> str:
             """Sub-agents either loop back to task_executor or go to END."""
@@ -267,11 +279,12 @@ class FlashBrainAgent:
                 "team_selection_agent": "team_selection_agent",
                 "finops_agent": "finops_agent",
                 "responder": "responder",
+                "check_dependency": "check_dependency",
                 END: END
             }
         )
         
-        # Task executor routes to sub-agents or aggregator
+        # Task executor routes to sub-agents or END
         workflow.add_conditional_edges(
             "task_executor",
             route_from_task_executor,
@@ -280,7 +293,7 @@ class FlashBrainAgent:
                 "team_selection_agent": "team_selection_agent",
                 "finops_agent": "finops_agent",
                 "responder": "responder",
-                "response_aggregator": "response_aggregator"
+                END: END
             }
         )
         
@@ -294,8 +307,9 @@ class FlashBrainAgent:
         workflow.add_conditional_edges("responder", route_from_subagents,
                                       {"task_executor": "task_executor", END: END})
         
-        # Aggregator ends
-        workflow.add_edge("response_aggregator", END)
+        # check_dependency routes to task_executor (resume) or END
+        workflow.add_conditional_edges("check_dependency", route_from_subagents,
+                                      {"task_executor": "task_executor", END: END})
 
         # Add Checkpointer for Memory - Use PostgreSQL for persistence (REQUIRED for production)
         if not self.postgres_connection:
@@ -310,25 +324,28 @@ class FlashBrainAgent:
 
             pool = AsyncConnectionPool(
                 conninfo=self.postgres_connection,
-                max_size=20,
-                min_size=1,
+                max_size=10,  # Reduced to prevent pool exhaustion
+                min_size=2,   # Keep warm connections ready
                 kwargs={
                     "autocommit": True,
                     "prepare_threshold": None,
                     "connect_timeout": 10,
                     "keepalives": 1,
-                    "keepalives_idle": 30,
-                    "keepalives_interval": 10,
-                    "keepalives_count": 5,
+                    "keepalives_idle": 10,  # Check health every 10s (faster detection)
+                    "keepalives_interval": 5,  # Probe every 5s if connection is suspect
+                    "keepalives_count": 3,  # Fail after 3 missed probes (15s total)
                 },
                 open=False,
-                timeout=30.0,  # Pool checkout timeout
-                max_waiting=10,  # Max clients waiting for a connection
-                max_idle=300.0,  # Max time a connection can stay idle (5 min)
-                reconnect_timeout=60.0,  # Time to wait before reconnecting
+                timeout=10.0,  # Fail faster if pool is stuck
+                max_waiting=5,  # Limit queue buildup
+                max_idle=60.0,  # Recycle idle connections after 1 min
+                reconnect_timeout=5.0,  # Reconnect faster on failure
+                check=AsyncConnectionPool.check_connection,  # Enable connection health checks
+                reset=False,  # Don't reset connections (they're autocommit anyway)
             )
 
             await pool.open()  # Explicitly open the pool
+            logger.info(f"Opened PostgreSQL connection pool ({pool.min_size}-{pool.max_size} connections)")
 
             checkpointer = AsyncPostgresSaver(pool)
             await checkpointer.setup()  # Create tables (works with autocommit)
@@ -513,6 +530,7 @@ class FlashBrainAgent:
         2. Detects if multiple distinct tasks exist (multi-intent).
         3. For single-intent: routes to appropriate agent (planning_agent, team_selection_agent, etc.)
         4. For multi-intent: creates pending_tasks list and routes to task_executor.
+        5. AWARE of pending jobs: LLM knows about waiting_for_project_id and can respond accordingly.
         """
 
         # Use pre-filtered messages from gateway if available, otherwise filter now
@@ -532,6 +550,12 @@ class FlashBrainAgent:
 
                 # Build message list with system prompt and conversation history
                 llm_messages = [{"role": "system", "content": ORCHESTRATOR_PROMPT}]
+                
+                # IMPORTANT: Add pending job context to system prompt if waiting
+                waiting_project_id = state.get("waiting_for_project_id")
+                if waiting_project_id:
+                    pending_job_context = PENDING_JOB_CONTEXT_TEMPLATE.format(project_id=waiting_project_id)
+                    llm_messages[0]["content"] = ORCHESTRATOR_PROMPT + "\n\n" + pending_job_context
 
                 # Add recent conversation history
                 for msg in recent_messages:
@@ -614,7 +638,6 @@ class FlashBrainAgent:
         2. If tasks remain, retrieves the current task type.
         3. Maps task type to the correct agent node (e.g., PROJECT_DECOMP -> planning_agent).
         4. Updates `next_step` to route to that agent.
-        5. If all tasks done, routes to `response_aggregator`.
         """
         pending_tasks = state.get("pending_tasks", [])
         current_idx = state.get("current_task_idx", 0)
@@ -623,8 +646,8 @@ class FlashBrainAgent:
 
         # Check if all tasks are complete
         if current_idx >= len(pending_tasks):
-            logger.info(f"[TASK_EXECUTOR] All tasks complete. Routing to response_aggregator")
-            return {"next_step": "response_aggregator"}
+            logger.info(f"[TASK_EXECUTOR] All tasks complete.")
+            return {"next_step": END}  # End immediately since results were streamed
 
         # Get current task
         current_task = pending_tasks[current_idx]
@@ -657,41 +680,101 @@ class FlashBrainAgent:
             "ui_messages": [AIMessage(content=f"⚙️ Processing task {current_idx + 1}/{len(pending_tasks)}: {task_question}")]
         }
 
-    def response_aggregator_node(self, state: BrainState) -> Dict[str, Any]:
+    def check_dependency_node(self, state: BrainState) -> Dict[str, Any]:
         """
-        Phase 3: Response Aggregation
-        Combines results from all completed tasks into a unified response.
+        Checks if a dependency (project plan) is ready and resumes suspended tasks.
+        Called when a job completion callback is received.
         
         Function:
-        1. Collects results from all items in `pending_tasks`.
-        2. Formats them into a single readable message (Task 1: ... Result: ...).
-        3. Updates `aggregated_response` in state.
-        4. Returns the final combined message to the user.
+        1. Queries brain_jobs table for job status.
+        2. If COMPLETED: resumes suspended tasks.
+        3. If FAILED: notifies user of error.
+        4. If still PENDING/RUNNING: returns END (wait longer).
         """
-        pending_tasks = state.get("pending_tasks", [])
+        project_id = state.get("waiting_for_project_id")
+        job_id = state.get("active_job_id")
+        
+        logger.info(f"[CHECK_DEPENDENCY] State keys: {list(state.keys())}")
+        logger.info(f"[CHECK_DEPENDENCY] waiting_for_project_id: {project_id}")
+        logger.info(f"[CHECK_DEPENDENCY] active_job_id: {job_id}")
+        
+        if not project_id or not job_id:
+            logger.warning("[CHECK_DEPENDENCY] No active job to check")
+            return {"next_step": END}
+        
+        logger.info(f"[CHECK_DEPENDENCY] Checking status for job {job_id}, project {project_id}")
+        
+        # Check job status in database
+        if self.supabase_client:
+            try:
+                response = self.supabase_client.table("brain_jobs")\
+                    .select("status, result, error")\
+                    .eq("id", job_id)\
+                    .single()\
+                    .execute()
+                
+                job = response.data
+                status = job.get("status")
+                logger.info(f"[CHECK_DEPENDENCY] Job status: {status}")
+                
+                if status == "COMPLETED":
+                    # Job done! Resume suspended tasks
+                    suspended_tasks = state.get("suspended_tasks", [])
+                    project_result = job.get("result", {})
+                    
+                    logger.info(f"[CHECK_DEPENDENCY] Job completed. {len(suspended_tasks)} suspended tasks to resume")
+                    
+                    if suspended_tasks:
+                        # Re-activate suspended tasks
+                        for task in suspended_tasks:
+                            task["status"] = "pending"
+                        
+                        return {
+                            "pending_tasks": suspended_tasks,
+                            "current_task_idx": 0,
+                            "waiting_for_project_id": None,
+                            "suspended_tasks": None,
+                            "active_job_id": None,
+                            "messages": [AIMessage(content=f"✅ Project plan is ready! Now continuing with your other tasks...")],
+                            "next_step": "task_executor"
+                        }
+                    else:
+                        # No suspended tasks, just notify user
+                        result_summary = project_result.get("summary", "Ready for review.") if isinstance(project_result, dict) else str(project_result)
+                        return {
+                            "waiting_for_project_id": None,
+                            "active_job_id": None,
+                            "messages": [AIMessage(content=f"✅ Project plan is complete!\n\n{result_summary}")],
+                            "next_step": END
+                        }
+                
+                elif status == "FAILED":
+                    error_msg = job.get("error", "Unknown error")
+                    logger.error(f"[CHECK_DEPENDENCY] Job failed: {error_msg}")
+                    return {
+                        "waiting_for_project_id": None,
+                        "active_job_id": None,
+                        "suspended_tasks": None,
+                        "messages": [AIMessage(content=f"❌ Project planning failed: {error_msg}")],
+                        "next_step": END
+                    }
+                
+                else:
+                    # Still pending/running
+                    logger.info(f"[CHECK_DEPENDENCY] Job still in progress (status: {status})")
+                    return {
+                        "messages": [AIMessage(content="Project plan is still in progress...")],
+                        "next_step": END
+                    }
+            
+            except Exception as e:
+                logger.error(f"[CHECK_DEPENDENCY] Failed to check job status: {e}")
+                return {"next_step": END}
+        else:
+            logger.error("[CHECK_DEPENDENCY] Supabase client not available")
+        
+        return {"next_step": END}
 
-        if not pending_tasks:
-            return {
-                "messages": [AIMessage(content="No tasks to aggregate.")],
-                "next_step": END
-            }
-
-        # Simple concatenation (v1 approach)
-        aggregated_parts = []
-        for i, task in enumerate(pending_tasks):
-            question = task.get("question", "Unknown task")
-            result = task.get("result", "No result available")
-
-            aggregated_parts.append(f"**Task {i + 1}**: {question}\n\n{result}")
-
-        aggregated_response = "\n\n---\n\n".join(aggregated_parts)
-
-        return {
-            "messages": [AIMessage(content=aggregated_response)],
-            "aggregated_response": aggregated_response,
-            "next_step": END,
-            "previous_step": "response_aggregator"
-        }
 
     def response_agent_node(self, state: BrainState) -> Dict[str, Any]:
         """
@@ -750,14 +833,19 @@ class FlashBrainAgent:
                     if hasattr(chunk, 'content') and chunk.content:
                         full_response += chunk.content
 
-                # Multi-intent: store result and advance
+                # Multi-intent: Store result AND send it immediately
                 if pending_tasks and current_idx is not None:
                     pending_tasks[current_idx]["status"] = "completed"
                     pending_tasks[current_idx]["result"] = full_response
                     
+                    # STREAM RESULT IMMEDIATELY instead of waiting for aggregation
+                    task_label = f"**Task {current_idx + 1}/{len(pending_tasks)}**: {pending_tasks[current_idx]['question']}"
+                    immediate_response = f"{task_label}\n\n{full_response}"
+                    
                     return {
                         "pending_tasks": pending_tasks,
                         "current_task_idx": current_idx + 1,
+                        "messages": [AIMessage(content=immediate_response)],  # Send immediately!
                         "next_step": "task_executor"
                     }
                 
@@ -807,16 +895,16 @@ class FlashBrainAgent:
     # --- Level 2: Reasoning Subsystems ---
 
     # 2a. Planning Agent (Async Job Pattern)
-    async def planning_agent_node(self, state: BrainState) -> Dict[str, Any]:
+    async def planning_agent_node(self, state: BrainState, config: RunnableConfig) -> Dict[str, Any]:
         """
         Calls the external Planning Agent via A2A protocol HTTP endpoint.
-        Enhanced for multi-intent support.
+        NOW CREATES ASYNC JOBS for long-running operations.
 
         Function:
         1. Connects to the Project Decomposition Agent service.
-        2. Sends the user's request (or specific task question) to decompose a project.
-        3. Streams the agent's progress and final result.
-        4. Stores the result in `pending_tasks` if in multi-intent mode.
+        2. Creates async job and fires request without waiting.
+        3. Returns immediately with "Job started" message.
+        4. Suspends dependent tasks if in multi-intent mode.
         """
         pending_tasks = state.get("pending_tasks")
         current_idx = state.get("current_task_idx")
@@ -825,7 +913,6 @@ class FlashBrainAgent:
 
         # Determine input message
         if pending_tasks and current_idx is not None:
-            # Multi-intent mode: use current task's question
             logger.info(f"[PLANNING_AGENT] Multi-intent: Processing task {current_idx + 1}/{len(pending_tasks)}")
             try:
                 message = pending_tasks[current_idx]["question"]
@@ -834,42 +921,91 @@ class FlashBrainAgent:
                 logger.error(f"[PLANNING_AGENT] Task missing 'question' field. Task: {pending_tasks[current_idx]}")
                 raise ValueError(f"Task {current_idx} missing 'question' field") from e
         else:
-            # Single-intent mode: use last message
             message = state["messages"][-1].content
             logger.info(f"[PLANNING_AGENT] Single-intent mode. Message: {message}")
         
-        agent_url = os.getenv("PROJECT_DECOMP_AGENT_URL", "http://localhost:8011")
-
-        # Collect all streaming updates from the A2A agent
-        all_updates = []
-        all_updates.append("🔄 Processing with Planning Agent...")
+        # Generate job ID and get thread_id from config
+        import uuid
+        job_id = str(uuid.uuid4())
+        thread_id = config.get("configurable", {}).get("thread_id", "default")
+        logger.info(f"[PLANNING_AGENT] Using thread_id: {thread_id}")
         
-        async for response_text in call_project_decomp_agent(
-            agent_url=agent_url,
-            message=message,
-            project_id=state.get("project_id"),
-            client_id=state.get("client_id"),
-            exist=False,
-            context_id=state.get("client_id", "default")
-        ):
-            all_updates.append(response_text)
-            final_response = response_text
-
-        # Multi-intent: store result and advance
-        if pending_tasks and current_idx is not None:
-            pending_tasks[current_idx]["status"] = "completed"
-            pending_tasks[current_idx]["result"] = final_response
-            
+        # Create job record in Supabase
+        if self.supabase_client:
+            try:
+                self.supabase_client.table("brain_jobs").insert({
+                    "id": job_id,
+                    "thread_id": thread_id,
+                    "task_type": "PROJECT_DECOMP",
+                    "status": "PENDING"
+                }).execute()
+                logger.info(f"[PLANNING_AGENT] Created job record: {job_id}")
+            except Exception as e:
+                logger.error(f"[PLANNING_AGENT] Failed to create job record: {e}")
+        
+        # Call agent with callback URL (fire-and-forget)
+        agent_url = os.getenv("PROJECT_DECOMP_AGENT_URL")
+        callback_url = os.getenv("ORCHESTRATOR_CALLBACK_URL", "http://localhost:8010/callbacks/project-complete")
+        
+        project_id = None
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{agent_url}/start-async",
+                    json={
+                        "message": message,
+                        "job_id": job_id,
+                        "callback_url": callback_url,
+                        "project_id": state.get("project_id"),
+                        "client_id": state.get("client_id")
+                    },
+                    timeout=5.0  # Just wait for "Job Started" response
+                )
+                response.raise_for_status()
+                data = response.json()
+                project_id = data.get("project_id")
+                logger.info(f"[PLANNING_AGENT] Async job started. Project ID: {project_id}")
+                
+                # Update job with project_id
+                if project_id and self.supabase_client:
+                    self.supabase_client.table("brain_jobs").update({
+                        "project_id": project_id
+                    }).eq("id", job_id).execute()
+        
+        except Exception as e:
+            logger.error(f"[PLANNING_AGENT] Failed to start async job: {e}")
             return {
-                "pending_tasks": pending_tasks,
-                "current_task_idx": current_idx + 1,
-                "next_step": "task_executor"  # Loop back
+                "messages": [AIMessage(content="Failed to start project planning. Please try again.")],
+                "next_step": END
             }
         
-        # Single-intent: return normally
-        combined_message = "\n".join(all_updates)
+        # Multi-intent: separate dependent tasks from independent ones
+        if pending_tasks and current_idx is not None:
+            remaining_tasks = pending_tasks[current_idx + 1:]
+            
+            # Only suspend tasks that DEPEND on the project plan
+            dependent_task_types = ['SELECT_FREELANCER', 'FINOPS']
+            suspended_tasks = [t for t in remaining_tasks if t.get('type') in dependent_task_types]
+            independent_tasks = [t for t in remaining_tasks if t.get('type') not in dependent_task_types]
+            
+            logger.info(f"[PLANNING_AGENT] Suspending {len(suspended_tasks)} dependent tasks, continuing with {len(independent_tasks)} independent tasks")
+            
+            return {
+                "waiting_for_project_id": project_id,
+                "suspended_tasks": suspended_tasks,
+                "active_job_id": job_id,
+                "pending_tasks": independent_tasks if independent_tasks else None,  # Continue with independent tasks
+                "current_task_idx": 0 if independent_tasks else None,
+                "messages": [AIMessage(content=f"I've started creating your project plan (ID: {project_id}). This will take about 5 minutes. Feel free to ask me other questions in the meantime!")],
+                "next_step": "task_executor" if independent_tasks else END
+            }
+        
+        # Single-intent: just wait
         return {
-            "messages": [AIMessage(content=combined_message)],
+            "waiting_for_project_id": project_id,
+            "active_job_id": job_id,
+            "messages": [AIMessage(content=f"I've started creating your project plan. I'll notify you when it's ready!")],
             "next_step": END
         }
 

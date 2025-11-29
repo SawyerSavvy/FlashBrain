@@ -1,11 +1,13 @@
 import logging
 import os
 import sys
+from typing import Optional
 
 import click
 import httpx
 import uvicorn
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
 
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -89,9 +91,102 @@ def main(host, port):
             agent_card=agent_card,
             http_handler=request_handler
         )
+        
+        # Get agent instance for async endpoint
+        project_decomp_agent = ProjectDecompAgent()
+        
+        # Define async job handler
+        async def handle_start_async(request):
+            """
+            Async endpoint for long-running project decomposition.
+            Accepts job_id and callback_url, executes in background, POSTs result to callback.
+            """
+            import asyncio
+            from pydantic import BaseModel
+            
+            class StartAsyncPayload(BaseModel):
+                message: str
+                job_id: str
+                callback_url: str
+                project_id: Optional[str] = None
+                client_id: Optional[str] = None
+            
+            try:
+                # Parse payload
+                payload_dict = await request.json()
+                payload = StartAsyncPayload(**payload_dict)
+                logger.info(f"[START_ASYNC] Received job {payload.job_id} with callback {payload.callback_url}")
+                
+                # Start background task
+                async def execute_and_callback():
+                    try:
+                        # Execute the graph
+                        result = await project_decomp_agent.graph.ainvoke({
+                            "messages": [HumanMessage(content=payload.message)],
+                            "project_id": payload.project_id,
+                            "client_id": payload.client_id
+                        })
+                        
+                        # Extract project_id from result
+                        project_id = result.get("project_id")
+                        
+                        # Send callback to orchestrator
+                        async with httpx.AsyncClient() as client:
+                            await client.post(
+                                payload.callback_url,
+                                json={
+                                    "project_id": project_id,
+                                    "job_id": payload.job_id,
+                                    "status": "COMPLETED",
+                                    "result": {"summary": "Project plan created successfully"}
+                                },
+                                timeout=10.0
+                            )
+                        logger.info(f"[START_ASYNC] Job {payload.job_id} completed, callback sent")
+                    
+                    except Exception as e:
+                        logger.error(f"[START_ASYNC] Job {payload.job_id} failed: {e}")
+                        # Send failure callback
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                await client.post(
+                                    payload.callback_url,
+                                    json={
+                                        "project_id": None,
+                                        "job_id": payload.job_id,
+                                        "status": "FAILED",
+                                        "error": str(e)
+                                    },
+                                    timeout=10.0
+                                )
+                        except Exception as callback_error:
+                            logger.error(f"[START_ASYNC] Failed to send error callback: {callback_error}")
+                
+                # Fire and forget
+                asyncio.create_task(execute_and_callback())
+                
+                # Return immediately
+                from starlette.responses import JSONResponse
+                return JSONResponse({
+                    "status": "started",
+                    "job_id": payload.job_id,
+                    "project_id": payload.project_id
+                })
+            
+            except Exception as e:
+                logger.error(f"[START_ASYNC] Failed to start job: {e}")
+                from starlette.responses import JSONResponse
+                return JSONResponse({"error": str(e)}, status_code=500)
+        
+        # Build app and add custom route
+        starlette_app = server.build()
+        from starlette.routing import Route
+        starlette_app.routes.append(
+            Route("/start-async", handle_start_async, methods=["POST"])
+        )
 
         logger.info(f'Starting Project Decomposition Agent on {host}:{port}')
-        uvicorn.run(server.build(), host=host, port=port)
+        uvicorn.run(starlette_app, host=host, port=port)
 
     except Exception as e:
         logger.error(f'An error occurred during server startup: {e}')
