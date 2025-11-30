@@ -1,3 +1,10 @@
+"""
+FlashBrain Orchestrator Server Entry Point
+
+This module starts the FlashBrain Orchestrator A2A server.
+Uses the simplified ReAct agent architecture with dynamic tool calling.
+"""
+
 import logging
 import os
 import sys
@@ -20,12 +27,12 @@ from a2a.types import (
     AgentSkill,
 )
 
-from FlashBrain import FlashBrainAgent
-from agent_executor import FlashBrainAgentExecutor
-
 from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
+
+from FlashBrain_ReAct import FlashBrainReActAgent
+from agent_executor import FlashBrainAgentExecutor
 
 load_dotenv(override=True)
 
@@ -39,6 +46,13 @@ logger = logging.getLogger(__name__)
 def main(host, port):
     """Starts the FlashBrain Orchestrator server."""
     try:
+        # Initialize the FlashBrain ReAct Agent
+        logger.info("Initializing FlashBrain ReAct Agent...")
+        flashbrain_agent = FlashBrainReActAgent()
+        agent_executor = FlashBrainAgentExecutor(agent=flashbrain_agent)
+        supported_content_types = FlashBrainReActAgent.SUPPORTED_CONTENT_TYPES
+        logger.info("FlashBrain ReAct Agent initialized successfully")
+        
         capabilities = AgentCapabilities(streaming=True, push_notifications=True)
 
         flashbrain_skill = AgentSkill(
@@ -60,17 +74,14 @@ def main(host, port):
 
         agent_card = AgentCard(
             name='FlashBrain Orchestrator',
-            description='The central orchestrator for the FlashBrain system, managing project planning, team selection, and financial operations.',
+            description='Intelligent AI orchestrator using ReAct pattern with dynamic tool calling for project management, team selection, and financial operations.',
             url=public_url,
-            version='1.0.0',
-            default_input_modes=FlashBrainAgent.SUPPORTED_CONTENT_TYPES,
-            default_output_modes=FlashBrainAgent.SUPPORTED_CONTENT_TYPES,
+            version='2.0.0',
+            default_input_modes=supported_content_types,
+            default_output_modes=supported_content_types,
             capabilities=capabilities,
             skills=[flashbrain_skill],
         )
-
-        # Get the agent instance (create if needed)
-        flashbrain_agent = FlashBrainAgent()
 
         # Create request handler
         httpx_client = httpx.AsyncClient()
@@ -81,7 +92,7 @@ def main(host, port):
         )
 
         request_handler = DefaultRequestHandler(
-            agent_executor=FlashBrainAgentExecutor(agent=flashbrain_agent),
+            agent_executor=agent_executor,
             task_store=InMemoryTaskStore(),
             push_config_store=push_config_store,
             push_sender=push_sender
@@ -101,11 +112,11 @@ def main(host, port):
             http_handler=request_handler
         )
         
-        # Define callback endpoint handler
+        # Define callback endpoint handler for async job completion
         async def handle_project_complete(request):
             """
             Callback endpoint for long-running project decomposition jobs.
-            Called by Project Decomp agent when a job finishes.
+            Called by sub-agents (e.g., Project Decomp agent) when async jobs finish.
             """
             try:
                 # Parse JSON payload
@@ -115,101 +126,24 @@ def main(host, port):
                 
                 # Update job status in database
                 if flashbrain_agent.supabase_client:
-                    # Retry logic for database operations (handle stale connections) Tries to update the connection max_retires times before giving up
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            flashbrain_agent.supabase_client.table("brain_jobs").update({
-                                "status": callback_data.status,
-                                "result": callback_data.result,
-                                "error": callback_data.error,
-                                "updated_at": "now()"
-                            }).eq("id", callback_data.job_id).execute()
-                            break  # Success, exit retry loop
-                        except Exception as e:
-                            logger.warning(f"Database update attempt {attempt + 1}/{max_retries} failed: {e}")
-                            if attempt == max_retries - 1:
-                                # Final attempt failed
-                                logger.error(f"Failed to update job status after {max_retries} attempts: {e}")
-                                from starlette.responses import JSONResponse
-                                return JSONResponse({"error": "Failed to update job"}, status_code=500)
-                            # Recreate Supabase client for retry
-                            try:
-                                from supabase import create_client
-                                flashbrain_agent.supabase_client = create_client(
-                                    flashbrain_agent.supabase_url,
-                                    flashbrain_agent.supabase_key
-                                )
-                                logger.info("Recreated Supabase client for retry")
-                            except Exception as recreate_error:
-                                logger.error(f"Failed to recreate Supabase client: {recreate_error}")
-                
-                # Find thread_id for this job
-                for attempt in range(max_retries):
                     try:
-                        job_record = flashbrain_agent.supabase_client.table("brain_jobs")\
-                            .select("thread_id")\
-                            .eq("id", callback_data.job_id)\
-                            .single()\
-                            .execute()
-                        
-                        thread_id = job_record.data["thread_id"]
-                        break  # Success
+                        flashbrain_agent.supabase_client.table("brain_jobs").update({
+                            "status": callback_data.status,
+                            "result": callback_data.result,
+                            "error": callback_data.error,
+                            "updated_at": "now()"
+                        }).eq("id", callback_data.job_id).execute()
+                        logger.info(f"Updated job {callback_data.job_id} status to {callback_data.status}")
                     except Exception as e:
-                        logger.warning(f"Thread lookup attempt {attempt + 1}/{max_retries} failed: {e}")
-                        if attempt == max_retries - 1:
-                            logger.error(f"Failed to find thread_id after {max_retries} attempts: {e}")
-                            from starlette.responses import JSONResponse
-                            return JSONResponse({"error": "Job not found"}, status_code=404)
+                        logger.error(f"Failed to update job status: {e}")
                 
-                # Resume the workflow
-                try:
-                    config = {"configurable": {"thread_id": thread_id}}
-                    
-                    # Get the current state from the checkpointer
-                    current_state = await flashbrain_agent.graph.aget_state(config)
-                    logger.info(f"[CALLBACK] Current state values: {list(current_state.values.keys())}")
-                    
-                    # Check if there are suspended tasks to resume
-                    suspended_tasks = current_state.values.get("suspended_tasks")
-                    waiting_project_id = current_state.values.get("waiting_for_project_id")
-                    
-                    logger.info(f"[CALLBACK] Suspended tasks: {len(suspended_tasks) if suspended_tasks else 0}")
-                    logger.info(f"[CALLBACK] Waiting for project: {waiting_project_id}")
-                    
-                    if suspended_tasks and waiting_project_id == callback_data.project_id:
-                        # Update the state to activate suspended tasks and route to task_executor
-                        await flashbrain_agent.graph.aupdate_state(
-                            config,
-                            {
-                                "waiting_for_project_id": None,
-                                "suspended_tasks": None,
-                                "active_job_id": None,
-                                "pending_tasks": suspended_tasks,
-                                "current_task_idx": 0,
-                                "next_step": "task_executor",  # Route directly to task_executor
-                                "messages": [AIMessage(content=f"✅ Project plan is ready! Now continuing with your other tasks...")]
-                            },
-                            as_node="check_dependency"  # Resume as if coming from check_dependency node
-                        )
-                        
-                        # Now invoke with None to continue from the updated state
-                        # This will pick up from task_executor node (next_step was set above)
-                        result = await flashbrain_agent.graph.ainvoke(None, config=config)
-                        
-                        logger.info(f"Successfully resumed {len(suspended_tasks)} suspended tasks for thread {thread_id}")
-                        from starlette.responses import JSONResponse
-                        return JSONResponse({"status": "resumed", "tasks_resumed": len(suspended_tasks)})
-                    else:
-                        # No suspended tasks, just notify user
-                        logger.info(f"[CALLBACK] No suspended tasks to resume for thread {thread_id}")
-                        from starlette.responses import JSONResponse
-                        return JSONResponse({"status": "completed", "message": "No tasks to resume"})
-                
-                except Exception as e:
-                    logger.error(f"Failed to resume workflow: {e}")
-                    from starlette.responses import JSONResponse
-                    return JSONResponse({"error": str(e)}, status_code=500)
+                # Acknowledge the callback
+                from starlette.responses import JSONResponse
+                return JSONResponse({
+                    "status": "acknowledged",
+                    "job_id": callback_data.job_id,
+                    "message": "Callback received and processed"
+                })
             
             except Exception as e:
                 logger.error(f"Callback processing failed: {e}")

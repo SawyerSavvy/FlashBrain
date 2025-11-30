@@ -1,5 +1,14 @@
+"""
+FlashBrain Agent Executor
+
+This module provides the A2A AgentExecutor wrapper for FlashBrain agents.
+Works with both the legacy FlashBrainAgent and the new FlashBrainReActAgent
+since they share the same stream() interface.
+"""
+
 import logging
-from typing import Dict, Any
+import os
+from typing import Dict, Any, Union
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -18,17 +27,35 @@ from a2a.utils import (
 )
 from a2a.utils.errors import ServerError
 
-from FlashBrain import FlashBrainAgent
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class FlashBrainAgentExecutor(AgentExecutor):
-    """FlashBrain Orchestrator AgentExecutor."""
+    """
+    FlashBrain Orchestrator AgentExecutor.
+    
+    Works with any agent that implements the stream() interface:
+        async def stream(query, context_id, client_id, project_id) -> AsyncGenerator
+    """
 
-    def __init__(self, agent: FlashBrainAgent = None):
-        self.agent = agent or FlashBrainAgent()
+    def __init__(self, agent=None):
+        """
+        Initialize the executor with an agent instance.
+        
+        Args:
+            agent: FlashBrainAgent or FlashBrainReActAgent instance
+        """
+        if agent is None:
+            # Default to ReAct agent if none provided
+            agent_type = os.getenv("FLASHBRAIN_AGENT_TYPE", "react").lower()
+            if agent_type == "legacy":
+                from FlashBrain import FlashBrainAgent
+                agent = FlashBrainAgent()
+            else:
+                from FlashBrain_ReAct import FlashBrainReActAgent
+                agent = FlashBrainReActAgent()
+        self.agent = agent
 
     async def execute(
         self,
