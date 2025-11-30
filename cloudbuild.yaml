@@ -131,7 +131,18 @@ steps:
       - '--port=8080'
     id: 'deploy-summarize'
 
-  # Deploy FlashBrain Orchestrator (min-instances=1, deployed last so it gets the URLs)
+  # Wait for all sub-agents to be fully deployed and stable
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "Waiting 30 seconds for sub-agents to stabilize..."
+        sleep 30
+    waitFor: ['deploy-project-decomp', 'deploy-freelancer', 'deploy-summarize']
+    id: 'wait-for-stability'
+
+  # Deploy FlashBrain Orchestrator (after sub-agents are stable)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -144,13 +155,13 @@ steps:
       - '--allow-unauthenticated'
       - '--min-instances=1'
       - '--max-instances=10'
-      - '--memory=512Mi'
-      - '--cpu=1'
+      - '--memory=1Gi'  # Increased for agent connections
+      - '--cpu=2'       # Increased for faster startup
       - '--cpu-boost'
-      - '--timeout=300'
+      - '--timeout=600'  # Increased timeout for initialization
       - '--concurrency=80'
       - '--port=8080'
-    waitFor: ['deploy-project-decomp', 'deploy-freelancer', 'deploy-summarize']
+    waitFor: ['wait-for-stability']  # Wait for sub-agents to be stable
     id: 'deploy-orchestrator'
 
   # Update all services with their PUBLIC_URL and inter-service URLs
