@@ -31,7 +31,7 @@ from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 
-from FlashBrain_ReAct import FlashBrainReActAgent
+from FlashBrain import FlashBrainReActAgent
 from agent_executor import FlashBrainAgentExecutor
 
 load_dotenv(override=True)

@@ -27,6 +27,8 @@ from a2a.utils import (
 )
 from a2a.utils.errors import ServerError
 
+from FlashBrain import FlashBrainReActAgent
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -44,17 +46,10 @@ class FlashBrainAgentExecutor(AgentExecutor):
         Initialize the executor with an agent instance.
         
         Args:
-            agent: FlashBrainAgent or FlashBrainReActAgent instance
+            agent: FlashBrainAgent instance
         """
         if agent is None:
-            # Default to ReAct agent if none provided
-            agent_type = os.getenv("FLASHBRAIN_AGENT_TYPE", "react").lower()
-            if agent_type == "legacy":
-                from FlashBrain import FlashBrainAgent
-                agent = FlashBrainAgent()
-            else:
-                from FlashBrain_ReAct import FlashBrainReActAgent
-                agent = FlashBrainReActAgent()
+            agent = FlashBrainReActAgent()
         self.agent = agent
 
     async def execute(
