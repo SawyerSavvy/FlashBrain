@@ -163,6 +163,9 @@ def main(host, port):
     except Exception as e:
         logger.error(f'An error occurred during server startup: {e}')
         sys.exit(1)
+    finally:
+        # Ensure cleanup if possible (though uvicorn captures SIGINT)
+        pass
 
 
 if __name__ == '__main__':

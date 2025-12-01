@@ -31,17 +31,15 @@ import asyncio
 import uuid
 import json
 import threading
-
 from prompts import FLASHBRAIN_SYSTEM_PROMPT
-
 from supabase import create_client
-
 from available_agents import AGENTS_URLS
-
 from a2a.client import A2ACardResolver
 from remote_agent_connections import RemoteAgentConnections
 
- # Create A2A message
+from psycopg_pool import AsyncConnectionPool
+
+# Create A2A message
 
 from a2a.types import (
     SendMessageRequest,
@@ -77,11 +75,11 @@ class FlashBrainReActAgent:
     This replaces the complex custom graph with a single ReAct agent
     that uses tools for all operations.
     """
-    
+
     SUPPORTED_CONTENT_TYPES = [
         'text', 'text/plain', 'application/json'
     ]
-    
+
     def __init__(
         self,
         supabase_url: str = None,
@@ -151,7 +149,50 @@ class FlashBrainReActAgent:
             raise exception[0]
         
         self.graph = result[0]
-     
+    
+    async def close(self):
+        """
+        Close resources and cleanup connections.
+        Call this on server shutdown to prevent connection leaks.
+        """
+        if hasattr(self, 'pool') and self.pool:
+            try:
+                await self.pool.close()
+                logger.info("PostgreSQL connection pool closed")
+            except Exception as e:
+                logger.error(f"Failed to close pool: {e}")
+      
+    def _create_request_human_input_tool(self):
+        """
+        Creates a tool that allows the agent to request input from the user.
+        Returns a structured JSON signal that the orchestrator can detect.
+        
+        Returns:
+            A LangChain tool function
+        """
+        @tool
+        def request_human_input(question: str, context: Optional[str] = None) -> str:
+            """
+            Request input or clarification from the human user.
+            Use this when you need more information to complete a task.
+            
+            Args:
+                question: The question to ask the user
+                context: Optional context about why you need this information
+            
+            Returns:
+                JSON signal that input is required
+            """
+            # Return structured JSON that the orchestrator can detect
+            payload = {
+                "type": "HUMAN_INPUT_REQUIRED",
+                "question": question,
+                "context": context or ""
+            }
+            return json.dumps(payload)
+        
+        return request_human_input
+    
     def _create_send_message_tool(self):
         """
         Creates the send_message tool with access to self.remote_agent_connections.
@@ -264,10 +305,11 @@ class FlashBrainReActAgent:
         ]
         self.agents = "\n".join(agent_info) if agent_info else "No agents available"
         logger.info(f"Initialized {len(self.cards)} agent connections")
-        
+
         # Define tools now that we have agent connections
         self.tools = [
             self._create_send_message_tool(),  # Generic tool for calling any agent
+            self._create_request_human_input_tool(),  # Request user input
         ]
         logger.info(f"Created {len(self.tools)} tools ({len(self.remote_agent_connections)} remote agents)")
         
@@ -277,15 +319,15 @@ class FlashBrainReActAgent:
                 "SUPABASE_TRANSACTION_POOLER environment variable is required. "
                 "FlashBrain cannot run without persistent state storage."
             )
-        
+
         try:
-            from psycopg_pool import AsyncConnectionPool
             
+
             # Cloud Run optimized connection pool settings
             # Increased max_size and max_waiting for test environment
             pool = AsyncConnectionPool(
                 conninfo=self.postgres_connection,
-                max_size=5,  # Increased from 2 to handle concurrent test queries
+                max_size=10,  # Increased to 10 to prevent exhaustion during dev/testing
                 min_size=0,
                 kwargs={
                     "autocommit": True,
@@ -298,8 +340,9 @@ class FlashBrainReActAgent:
                 },
                 open=False,
                 timeout=20.0,
-                max_waiting=5,  # Increased from 2 to allow more queued requests
-                max_idle=30.0,
+                max_waiting=20,  # Allow more queued requests
+                max_idle=30.0,   # Recycle idle connections quickly
+                max_lifetime=300.0, # Close connections after 5 mins to prevent leaks
                 reconnect_timeout=10.0,
                 check=AsyncConnectionPool.check_connection,
                 reset=False,
@@ -308,10 +351,13 @@ class FlashBrainReActAgent:
             await pool.open()
             logger.info(f"PostgreSQL connection pool opened ({pool.min_size}-{pool.max_size} connections)")
             
+            # Store pool reference for cleanup
+            self.pool = pool
+            
             checkpointer = AsyncPostgresSaver(pool)
             await checkpointer.setup()
             logger.info("AsyncPostgresSaver checkpointer initialized")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize PostgreSQL checkpointer: {e}", exc_info=True)
             raise RuntimeError(f"Failed to initialize checkpointer: {e}") from e
@@ -338,13 +384,13 @@ class FlashBrainReActAgent:
         """
         if not self.supabase_client:
             return
-        
+
         try:
             response = self.supabase_client.table("brain_conversations")\
                 .select("id")\
                 .eq("id", conversation_id)\
                 .execute()
-            
+
             if not response.data:
                 self.supabase_client.table("brain_conversations").insert({
                     "id": conversation_id,
@@ -353,7 +399,7 @@ class FlashBrainReActAgent:
                 }).execute()
         except Exception as e:
             logger.error(f"Failed to ensure conversation exists: {e}")
-    
+
     async def save_message(
         self,
         conversation_id: str,
@@ -379,7 +425,7 @@ class FlashBrainReActAgent:
                 "role": role,
                 "content": content,
                 "metadata": metadata or {}
-            }).execute()
+                }).execute()
         except Exception as e:
             logger.error(f"Failed to save message: {e}")
     
@@ -398,7 +444,7 @@ class FlashBrainReActAgent:
             context_id: Conversation thread ID
             client_id: Client ID for authentication
             project_id: Current project ID context
-        
+
         Yields:
             Dict with streaming response data:
                 - is_task_complete: bool
@@ -406,7 +452,7 @@ class FlashBrainReActAgent:
                 - content: str
         """
         config = {"configurable": {"thread_id": context_id}}
-        
+
         try:
             # Ensure conversation exists
             await self.ensure_conversation_exists(context_id, client_id)
@@ -435,11 +481,11 @@ class FlashBrainReActAgent:
             messages.append(HumanMessage(content=query))
             
             final_response = ""
-            
+
             # Stream from the ReAct agent
             async for event in self.graph.astream(
                 {"messages": messages},
-                config=config,
+                config=config, 
                 stream_mode="messages"
             ):
                 # Handle different event types
@@ -456,13 +502,55 @@ class FlashBrainReActAgent:
                                 # Convert list to string
                                 content = '\n'.join([str(item) for item in content])
                             
-                            final_response = content
-                            yield {
-                                'is_task_complete': False,
-                                'require_user_input': False,
-                                'content': content
-                            }
-            
+                            # Check if human input is required by detecting JSON signal
+                            requires_input = False
+                            human_request = None
+                            
+                            try:
+                                # Try to parse as JSON (in case the content is the tool output)
+                                data = json.loads(content)
+                                if data.get("type") == "HUMAN_INPUT_REQUIRED":
+                                    requires_input = True
+                                    human_request = data
+                            except (json.JSONDecodeError, TypeError):
+                                # Not JSON, check for plain text signal
+                                if '"type": "HUMAN_INPUT_REQUIRED"' in content or '"type":"HUMAN_INPUT_REQUIRED"' in content:
+                                    requires_input = True
+                                    # Try to extract from the text
+                                    try:
+                                        start_idx = content.find('{')
+                                        end_idx = content.rfind('}') + 1
+                                        if start_idx >= 0 and end_idx > start_idx:
+                                            human_request = json.loads(content[start_idx:end_idx])
+                                    except:
+                                        pass
+                            
+                            if requires_input and human_request:
+                                # Extract question from the structured payload
+                                question = human_request.get("question", "Please provide more information")
+                                context_info = human_request.get("context", "")
+                                
+                                response_content = question
+                                if context_info:
+                                    response_content += f"\n\nContext: {context_info}"
+                                
+                                    yield {
+                                        'is_task_complete': False,
+                                    'require_user_input': True,
+                                    'content': response_content
+                                    }
+                                # Stop streaming - wait for user response
+                                logger.info(f"Human input requested: {question}")
+                                return
+                            else:
+                                # Normal message
+                                final_response = content
+                                yield {
+                                    'is_task_complete': False,
+                                    'require_user_input': False,
+                                    'content': content
+                                }
+
             # Save final AI response
             if final_response:
                 await self.save_message(
@@ -482,7 +570,15 @@ class FlashBrainReActAgent:
                     'require_user_input': False,
                     'content': "Task completed."
                 }
-        
+
+        except GeneratorExit:
+            logger.warning(f"Stream cancelled by client for thread {context_id}")
+            # Checkpointer context manager should handle cleanup
+            raise
+        except GeneratorExit:
+            logger.warning(f"Stream cancelled by client for thread {context_id}. Cleaning up.")
+            # Ensure the generator is closed properly
+            raise
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             yield {
@@ -490,7 +586,7 @@ class FlashBrainReActAgent:
                 'require_user_input': True,
                 'content': f"An error occurred: {str(e)}"
             }
-    
+
     def invoke(
         self,
         message: str,
@@ -521,8 +617,8 @@ class FlashBrainReActAgent:
                     project_id = parsed.get("project_id", project_id)
             except json.JSONDecodeError:
                 pass
-        
-        config = {"configurable": {"thread_id": thread_id}}
+
+        config = {"configurable": {"thread_id": thread_id}} 
         
         # Build message list with system prompt and context (same as stream method)
         messages = [SystemMessage(content=FLASHBRAIN_SYSTEM_PROMPT)]
@@ -552,7 +648,7 @@ class FlashBrainReActAgent:
                     if isinstance(last_msg, AIMessage) and last_msg.content:
                         if not last_msg.tool_calls:
                             final_response = last_msg.content
-        
+                
         return {
             "response": final_response,
             "thread_id": thread_id
