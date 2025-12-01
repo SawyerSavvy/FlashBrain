@@ -1,0 +1,1152 @@
+openapi: 3.1.0
+
+info:
+  title: FlashBrain Orchestrator API
+  version: 2.0.0
+  description: |
+    FlashBrain Orchestrator is an intelligent AI agent that orchestrates project management tasks
+    using the A2A (Agent-to-Agent) protocol. It dynamically connects to specialized sub-agents
+    for project planning, team selection, and financial analysis.
+    
+    ## Features
+    - Multi-agent orchestration via A2A protocol
+    - Dynamic tool calling with LangGraph ReAct pattern
+    - Streaming responses
+    - Human-in-the-loop support
+    - Persistent conversation state
+    - Multi-turn conversations with memory
+    
+    ## Authentication
+    Currently accepts unauthenticated requests. Authentication via metadata fields:
+    - `client_id`: Client identifier for authorization
+    - `project_id`: Project context for requests
+  
+  contact:
+    name: FlashBrain Support
+    email: support@flashbrain.com
+  
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://flashbrain-orchestrator-935893169019.us-central1.run.app
+    description: Production server (Cloud Run)
+  - url: http://localhost:8010
+    description: Local development server
+
+tags:
+  - name: Agent Card
+    description: Agent metadata and capabilities discovery
+  - name: Messaging
+    description: Send messages and interact with the agent
+  - name: Chat
+    description: Direct chatbot streaming endpoints (non-A2A)
+  - name: Tasks
+    description: Task management and status tracking
+  - name: Callbacks
+    description: Webhook callbacks for async operations
+
+paths:
+  /.well-known/agent-card.json:
+    get:
+      tags:
+        - Agent Card
+      summary: Get Agent Card
+      description: |
+        Retrieve the agent's metadata including name, version, capabilities, and available skills.
+        This endpoint follows the A2A protocol standard for agent discovery.
+      operationId: getAgentCard
+      responses:
+        '200':
+          description: Successfully retrieved agent card
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCard'
+              example:
+                name: FlashBrain Orchestrator
+                description: Intelligent AI orchestrator using ReAct pattern with dynamic tool calling
+                url: https://flashbrain-orchestrator.example.com
+                version: "2.0.0"
+                protocol_version: "0.3.0"
+                preferred_transport: JSONRPC
+                capabilities:
+                  streaming: true
+                  push_notifications: true
+                skills:
+                  - id: flashbrain_orchestrator
+                    name: FlashBrain Orchestrator
+                    description: Orchestrates the entire FlashBrain system
+                    tags: [orchestrator, brain, routing]
+                    examples:
+                      - Help me plan my project
+                      - I need to select freelancers
+                default_input_modes: [text/plain, application/json]
+                default_output_modes: [text/plain, application/json]
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /:
+    post:
+      tags:
+        - Messaging
+      summary: JSON-RPC Endpoint
+      description: |
+        Main JSON-RPC endpoint for A2A protocol communication.
+        Supports methods: message/send, message/stream, task/get, task/cancel
+      operationId: jsonRpcEndpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JSONRPCRequest'
+            examples:
+              sendMessage:
+                summary: Send a message
+                value:
+                  jsonrpc: "2.0"
+                  id: 1
+                  method: message/send
+                  params:
+                    message:
+                      role: user
+                      parts:
+                        - kind: text
+                          text: What is project management?
+                      message_id: msg_123
+                      metadata:
+                        client_id: user_456
+                        project_id: proj_789
+              streamMessage:
+                summary: Stream a message
+                value:
+                  jsonrpc: "2.0"
+                  id: 2
+                  method: message/stream
+                  params:
+                    message:
+                      role: user
+                      parts:
+                        - kind: text
+                          text: Create a project plan for my app
+      responses:
+        '200':
+          description: JSON-RPC response
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JSONRPCSuccessResponse'
+                  - $ref: '#/components/schemas/JSONRPCErrorResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /message/send:
+    post:
+      tags:
+        - Messaging
+      summary: Send Message (Non-Streaming)
+      description: |
+        Send a message to FlashBrain and wait for the complete response.
+        This is a non-streaming endpoint that returns the final result.
+      operationId: sendMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageSendParams'
+            example:
+              message:
+                role: user
+                parts:
+                  - kind: text
+                    text: What are the benefits of having a project manager?
+                message_id: msg_abc123
+                context_id: conversation_xyz
+                metadata:
+                  client_id: user_123
+                  project_id: proj_456
+      responses:
+        '200':
+          description: Message processed successfully
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Task'
+                  - $ref: '#/components/schemas/Message'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /message/stream:
+    post:
+      tags:
+        - Messaging
+      summary: Send Message (Streaming)
+      description: |
+        Send a message to FlashBrain and receive streaming updates.
+        Returns Server-Sent Events (SSE) with progress updates, partial responses, and final result.
+      operationId: streamMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageSendParams'
+      responses:
+        '200':
+          description: Stream of events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream
+              example: |
+                data: {"type": "task_status_update", "task_id": "task_123", "status": {"state": "working"}}
+                
+                data: {"type": "message", "content": "I'm analyzing your request..."}
+                
+                data: {"type": "task", "id": "task_123", "status": {"state": "completed"}}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /tasks/get:
+    post:
+      tags:
+        - Tasks
+      summary: Get Task Status
+      description: Retrieve the current status of a task by its ID
+      operationId: getTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - task_id
+              properties:
+                task_id:
+                  type: string
+                  description: The unique identifier of the task
+                  example: task_abc123
+      responses:
+        '200':
+          description: Task retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Task not found
+                task_id: task_abc123
+
+  /tasks/cancel:
+    post:
+      tags:
+        - Tasks
+      summary: Cancel Task
+      description: Cancel a running task
+      operationId: cancelTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - task_id
+              properties:
+                task_id:
+                  type: string
+                  description: The unique identifier of the task to cancel
+      responses:
+        '200':
+          description: Task canceled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Task not found
+
+  /chat/stream:
+    post:
+      tags:
+        - Chat
+      summary: Direct Chat Streaming (Non-A2A)
+      description: |
+        Direct streaming endpoint for frontend clients to chat with FlashBrain.
+        This bypasses the A2A protocol and provides simple HTTP streaming.
+
+        Returns Server-Sent Events (SSE) with real-time responses.
+
+        **Use this endpoint when:**
+        - Building a frontend chat interface
+        - You want simple HTTP streaming without A2A complexity
+        - You need real-time chatbot responses
+
+        **Use A2A endpoints when:**
+        - Building agent-to-agent communication
+        - You need full A2A protocol features (task management, artifacts, etc.)
+      operationId: chatStream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatStreamRequest'
+            example:
+              message: "Help me plan a project for an e-commerce website"
+              conversation_id: "user_123_session_456"
+              client_id: "client_abc"
+              project_id: "proj_xyz"
+      responses:
+        '200':
+          description: Stream of chat events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream with JSON payloads
+              example: |
+                data: {"is_task_complete": false, "require_user_input": false, "content": "I'll help you plan your e-commerce project. Let me gather some information..."}
+
+                data: {"is_task_complete": false, "require_user_input": false, "content": " I'm analyzing your requirements..."}
+
+                data: {"is_task_complete": true, "require_user_input": false, "content": ""}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /callbacks/project-complete:
+    post:
+      tags:
+        - Callbacks
+      summary: Project Completion Callback
+      description: |
+        Webhook endpoint called by sub-agents (e.g., Project Decomposition Agent)
+        when a long-running async job completes.
+      operationId: handleProjectComplete
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCompletePayload'
+            example:
+              project_id: proj_abc123
+              job_id: job_xyz789
+              status: COMPLETED
+              result:
+                summary: Project plan created successfully
+                phases: 5
+                estimated_cost: 50000
+      responses:
+        '200':
+          description: Callback acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: acknowledged
+                  job_id:
+                    type: string
+                  message:
+                    type: string
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /health:
+    get:
+      tags:
+        - Agent Card
+      summary: Health Check
+      description: Check if the service is healthy and responding
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  version:
+                    type: string
+                    example: "2.0.0"
+
+components:
+  schemas:
+    AgentCard:
+      type: object
+      required:
+        - name
+        - description
+        - url
+        - version
+        - protocol_version
+      properties:
+        name:
+          type: string
+          description: Name of the agent
+          example: FlashBrain Orchestrator
+        description:
+          type: string
+          description: Description of the agent's capabilities
+        url:
+          type: string
+          format: uri
+          description: Base URL of the agent
+        version:
+          type: string
+          description: Agent version
+          example: "2.0.0"
+        protocol_version:
+          type: string
+          description: A2A protocol version
+          example: "0.3.0"
+        preferred_transport:
+          type: string
+          enum: [JSONRPC, GRPC, HTTP]
+          description: Preferred transport protocol
+        capabilities:
+          $ref: '#/components/schemas/AgentCapabilities'
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentSkill'
+        default_input_modes:
+          type: array
+          items:
+            type: string
+          example: [text/plain, application/json]
+        default_output_modes:
+          type: array
+          items:
+            type: string
+          example: [text/plain, application/json]
+    
+    AgentCapabilities:
+      type: object
+      properties:
+        streaming:
+          type: boolean
+          description: Whether agent supports streaming responses
+        push_notifications:
+          type: boolean
+          description: Whether agent supports push notifications/callbacks
+        state_transition_history:
+          type: boolean
+          description: Whether agent provides state transition history
+    
+    AgentSkill:
+      type: object
+      required:
+        - id
+        - name
+        - description
+      properties:
+        id:
+          type: string
+          example: flashbrain_orchestrator
+        name:
+          type: string
+          example: FlashBrain Orchestrator
+        description:
+          type: string
+          example: Orchestrates the entire FlashBrain system
+        tags:
+          type: array
+          items:
+            type: string
+          example: [orchestrator, brain, routing]
+        examples:
+          type: array
+          items:
+            type: string
+          example:
+            - Help me plan my project
+            - Find freelancers for my team
+    
+    Message:
+      type: object
+      required:
+        - role
+        - parts
+        - message_id
+      properties:
+        role:
+          type: string
+          enum: [user, agent]
+          description: Sender role
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+          description: Message content parts
+        message_id:
+          type: string
+          description: Unique message identifier
+          example: msg_abc123xyz
+        context_id:
+          type: string
+          description: Conversation context/thread ID for multi-turn conversations
+          example: conversation_xyz789
+        metadata:
+          type: object
+          description: Additional metadata
+          properties:
+            client_id:
+              type: string
+              description: Client identifier for authorization
+            project_id:
+              type: string
+              description: Project context
+            user_id:
+              type: string
+              description: User identifier
+          additionalProperties: true
+        task_id:
+          type: string
+          description: Associated task ID
+    
+    Part:
+      oneOf:
+        - $ref: '#/components/schemas/TextPart'
+        - $ref: '#/components/schemas/FilePart'
+        - $ref: '#/components/schemas/DataPart'
+      discriminator:
+        propertyName: kind
+        mapping:
+          text: '#/components/schemas/TextPart'
+          file: '#/components/schemas/FilePart'
+          data: '#/components/schemas/DataPart'
+    
+    TextPart:
+      type: object
+      required:
+        - kind
+        - text
+      properties:
+        kind:
+          type: string
+          enum: [text]
+        text:
+          type: string
+          description: Text content
+          example: What is the weather in Paris?
+        metadata:
+          type: object
+          additionalProperties: true
+    
+    FilePart:
+      type: object
+      required:
+        - kind
+        - file
+      properties:
+        kind:
+          type: string
+          enum: [file]
+        file:
+          oneOf:
+            - $ref: '#/components/schemas/FileWithUri'
+            - $ref: '#/components/schemas/FileWithBytes'
+        metadata:
+          type: object
+          additionalProperties: true
+    
+    FileWithUri:
+      type: object
+      required:
+        - uri
+      properties:
+        uri:
+          type: string
+          format: uri
+          description: URL to the file
+          example: https://storage.example.com/files/document.pdf
+        name:
+          type: string
+          description: File name
+          example: document.pdf
+        mime_type:
+          type: string
+          description: MIME type
+          example: application/pdf
+    
+    FileWithBytes:
+      type: object
+      required:
+        - bytes
+      properties:
+        bytes:
+          type: string
+          format: byte
+          description: Base64-encoded file bytes
+        name:
+          type: string
+          description: File name
+        mime_type:
+          type: string
+          description: MIME type
+    
+    DataPart:
+      type: object
+      required:
+        - kind
+        - data
+      properties:
+        kind:
+          type: string
+          enum: [data]
+        data:
+          type: object
+          description: Structured data (JSON)
+          additionalProperties: true
+          example:
+            filters: [category:sales, date:2024]
+            limit: 100
+        metadata:
+          type: object
+          additionalProperties: true
+    
+    Task:
+      type: object
+      required:
+        - id
+        - context_id
+        - status
+      properties:
+        id:
+          type: string
+          description: Unique task identifier
+          example: task_abc123
+        context_id:
+          type: string
+          description: Conversation context ID
+          example: conversation_xyz
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+          description: Task output artifacts
+    
+    TaskStatus:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          type: string
+          enum: [pending, working, completed, failed, canceled, input_required]
+          description: Current task state
+        message:
+          $ref: '#/components/schemas/Message'
+          description: Status message or result
+    
+    Artifact:
+      type: object
+      required:
+        - artifact_id
+        - parts
+      properties:
+        artifact_id:
+          type: string
+          description: Unique artifact identifier
+        name:
+          type: string
+          description: Artifact name
+          example: project_plan.json
+        description:
+          type: string
+          description: Artifact description
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+    
+    MessageSendParams:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          $ref: '#/components/schemas/Message'
+        task_id:
+          type: string
+          description: Optional task ID to continue an existing task
+        config:
+          type: object
+          description: Optional configuration
+          additionalProperties: true
+    
+    JSONRPCRequest:
+      type: object
+      required:
+        - jsonrpc
+        - method
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          enum: [message/send, message/stream, task/get, task/cancel]
+          description: RPC method to invoke
+        params:
+          type: object
+          description: Method parameters
+          additionalProperties: true
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+          description: Request identifier
+    
+    JSONRPCSuccessResponse:
+      type: object
+      required:
+        - jsonrpc
+        - result
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/Task'
+            - $ref: '#/components/schemas/Message'
+          description: Method result
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+    
+    JSONRPCErrorResponse:
+      type: object
+      required:
+        - jsonrpc
+        - error
+        - id
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: integer
+              description: Error code
+              example: -32603
+            message:
+              type: string
+              description: Error message
+              example: Internal error
+            data:
+              type: object
+              description: Additional error data
+              additionalProperties: true
+        id:
+          oneOf:
+            - type: string
+            - type: integer
+            - type: "null"
+    
+    ChatStreamRequest:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: User's message/query
+          example: "Help me plan a project"
+        conversation_id:
+          type: string
+          description: Conversation/session identifier for multi-turn conversations
+          default: "default"
+          example: "user_123_session_456"
+        client_id:
+          type: string
+          description: Client identifier for authorization and context
+          example: "client_abc123"
+        project_id:
+          type: string
+          description: Project context identifier
+          example: "proj_xyz789"
+
+    ChatStreamEvent:
+      type: object
+      required:
+        - is_task_complete
+        - require_user_input
+        - content
+      properties:
+        is_task_complete:
+          type: boolean
+          description: Whether the task is complete
+          example: false
+        require_user_input:
+          type: boolean
+          description: Whether user input is required to continue
+          example: false
+        content:
+          type: string
+          description: Response content (empty string in final completion event)
+          example: "I'll help you with that project..."
+
+    ProjectCompletePayload:
+      type: object
+      required:
+        - project_id
+        - job_id
+        - status
+      properties:
+        project_id:
+          type: string
+          description: Project identifier
+          example: proj_abc123
+        job_id:
+          type: string
+          description: Job identifier
+          example: job_xyz789
+        status:
+          type: string
+          enum: [COMPLETED, FAILED, PENDING, RUNNING]
+          description: Job completion status
+        result:
+          type: object
+          description: Job result data
+          additionalProperties: true
+        error:
+          type: string
+          description: Error message if status is FAILED
+    
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+        details:
+          type: object
+          additionalProperties: true
+  
+  responses:
+    BadRequest:
+      description: Bad request - invalid input parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Invalid message format
+            details:
+              field: message.parts
+              issue: parts array cannot be empty
+    
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Internal server error
+            details:
+              message: An unexpected error occurred
+
+  examples:
+    SimpleTextMessage:
+      summary: Simple text message
+      value:
+        message:
+          role: user
+          parts:
+            - kind: text
+              text: What is agile methodology?
+          message_id: msg_001
+          metadata:
+            client_id: user_123
+    
+    ProjectPlanningRequest:
+      summary: Project planning request
+      value:
+        message:
+          role: user
+          parts:
+            - kind: text
+              text: Create a project plan for an e-commerce website with React frontend
+          message_id: msg_002
+          context_id: conversation_abc
+          metadata:
+            client_id: user_456
+            project_id: proj_789
+    
+    MultiPartMessage:
+      summary: Multi-part message with text and data
+      value:
+        message:
+          role: user
+          parts:
+            - kind: text
+              text: Analyze this project data
+            - kind: data
+              data:
+                project_type: mobile_app
+                budget: 50000
+                timeline_months: 3
+          message_id: msg_003
+          metadata:
+            client_id: user_789
+    
+    FileUploadMessage:
+      summary: Message with file attachment
+      value:
+        message:
+          role: user
+          parts:
+            - kind: text
+              text: Review this project specification document
+            - kind: file
+              file:
+                uri: https://storage.googleapis.com/bucket/spec.pdf
+                name: project_spec.pdf
+                mime_type: application/pdf
+          message_id: msg_004
+
+x-documentation:
+  usage_examples:
+    chat_stream_python: |
+      ```python
+      # Direct Chat Streaming (Recommended for frontends)
+      import asyncio
+      import httpx
+      import json
+      from uuid import uuid4
+
+      async def chat_with_flashbrain():
+          async with httpx.AsyncClient() as client:
+              url = "https://flashbrain-orchestrator.example.com/chat/stream"
+              payload = {
+                  "message": "Help me plan a project",
+                  "conversation_id": str(uuid4()),
+                  "client_id": "user_123",
+                  "project_id": "proj_456"
+              }
+
+              async with client.stream("POST", url, json=payload) as response:
+                  async for line in response.aiter_lines():
+                      if line.startswith("data: "):
+                          event = json.loads(line[6:])
+
+                          if event["content"]:
+                              print(event["content"], end='', flush=True)
+
+                          if event["is_task_complete"]:
+                              break
+
+              print("\n✅ Done")
+
+      asyncio.run(chat_with_flashbrain())
+      ```
+
+    chat_stream_curl: |
+      ```bash
+      # Direct Chat Streaming
+      curl -N -X POST https://flashbrain-orchestrator.example.com/chat/stream \
+        -H "Content-Type: application/json" \
+        -d '{
+          "message": "Help me plan a project",
+          "conversation_id": "session_123",
+          "client_id": "user_abc",
+          "project_id": "proj_xyz"
+        }'
+
+      # Response (Server-Sent Events):
+      # data: {"is_task_complete": false, "require_user_input": false, "content": "I'll help you..."}
+      # data: {"is_task_complete": true, "require_user_input": false, "content": ""}
+      ```
+
+    python: |
+      ```python
+      # A2A Protocol (For agent-to-agent communication)
+      import asyncio
+      import httpx
+      from uuid import uuid4
+
+      async def call_flashbrain():
+          async with httpx.AsyncClient() as client:
+              # Get agent card
+              card_response = await client.get(
+                  "https://flashbrain-orchestrator.example.com/.well-known/agent-card.json"
+              )
+              print(card_response.json())
+
+              # Send message (JSON-RPC)
+              message_response = await client.post(
+                  "https://flashbrain-orchestrator.example.com/",
+                  json={
+                      "jsonrpc": "2.0",
+                      "method": "message/send",
+                      "params": {
+                          "message": {
+                              "role": "user",
+                              "parts": [{"kind": "text", "text": "Hello!"}],
+                              "message_id": uuid4().hex,
+                              "metadata": {"client_id": "user_123"}
+                          }
+                      },
+                      "id": 1
+                  }
+              )
+              print(message_response.json())
+
+      asyncio.run(call_flashbrain())
+      ```
+    
+    curl: |
+      ```bash
+      # Get agent card
+      curl https://flashbrain-orchestrator.example.com/.well-known/agent-card.json
+      
+      # Send message
+      curl -X POST https://flashbrain-orchestrator.example.com/ \
+        -H "Content-Type: application/json" \
+        -d '{
+          "jsonrpc": "2.0",
+          "method": "message/send",
+          "params": {
+            "message": {
+              "role": "user",
+              "parts": [{"kind": "text", "text": "What is project management?"}],
+              "message_id": "msg_123",
+              "metadata": {"client_id": "user_456"}
+            }
+          },
+          "id": 1
+        }'
+      ```
+    
+    a2a_sdk: |
+      ```python
+      from a2a.client import A2ACardResolver, ClientFactory, ClientConfig
+      from a2a.types import Message, Part, TextPart, Role
+      from uuid import uuid4
+      import httpx
+      
+      async def use_a2a_sdk():
+          async with httpx.AsyncClient() as httpx_client:
+              # Discover agent
+              resolver = A2ACardResolver(
+                  httpx_client=httpx_client,
+                  base_url="https://flashbrain-orchestrator.example.com"
+              )
+              agent_card = await resolver.get_agent_card()
+              
+              # Connect
+              client_config = ClientConfig(httpx_client=httpx_client)
+              client = await ClientFactory.connect(
+                  agent=agent_card,
+                  client_config=client_config
+              )
+              
+              # Send message
+              message = Message(
+                  role=Role.user,
+                  parts=[Part(root=TextPart(text="Create a project plan"))],
+                  message_id=uuid4().hex,
+                  metadata={"client_id": "user_123"}
+              )
+              
+              # Stream responses
+              async for event in client.send_message(message):
+                  if isinstance(event, tuple):
+                      task, update = event
+                      print(f"State: {task.status.state}")
+                      if task.status.message:
+                          print(task.status.message.parts[0].root.text)
+      ```
+  
+  conversation_flow:
+    description: |
+      ## Multi-Turn Conversation Flow
+      
+      1. Client sends initial message with `context_id`
+      2. FlashBrain processes and responds
+      3. Client sends follow-up with SAME `context_id`
+      4. FlashBrain accesses conversation history via checkpointer
+      5. Continues conversation with full context
+      
+      ## Human-in-the-Loop Flow
+      
+      1. Client sends request
+      2. FlashBrain determines it needs clarification
+      3. Returns task with `state: input_required`
+      4. Client collects user input
+      5. Client sends input as new message with same `context_id`
+      6. FlashBrain continues with provided information
+      
+      ## Async Job Flow
+      
+      1. Client requests long-running task (e.g., project planning)
+      2. FlashBrain delegates to sub-agent via A2A
+      3. Returns immediately with job_id
+      4. Sub-agent processes async
+      5. Sub-agent calls `/callbacks/project-complete` when done
+      6. FlashBrain updates job status in database
+
+  rate_limiting:
+    description: |
+      Currently no rate limiting is enforced.
+      For production usage, implement client-side rate limiting:
+      - Max 10 requests per second per client_id
+      - Max 100 concurrent conversations per client_id
+
+  authentication:
+    description: |
+      Current implementation accepts unauthenticated requests.
+      
+      For authenticated requests, include in message metadata:
+      ```json
+      {
+        "metadata": {
+          "client_id": "your-client-id",
+          "api_key": "your-api-key"  // Future implementation
+        }
+      }
+      ```
+

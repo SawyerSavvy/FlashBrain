@@ -481,17 +481,18 @@ class FlashBrainReActAgent:
             messages.append(HumanMessage(content=query))
             
             final_response = ""
+            seen_content = set()  # Track already-yielded content to avoid duplicates
 
             # Stream from the ReAct agent
             async for event in self.graph.astream(
                 {"messages": messages},
-                config=config, 
+                config=config,
                 stream_mode="messages"
             ):
                 # Handle different event types
                 if isinstance(event, tuple):
-                    message, metadata = event
-                    
+                    message, _ = event
+
                     # Stream AI message content
                     if isinstance(message, AIMessage) and message.content:
                         # Skip tool call messages (they have tool_calls attribute)
@@ -501,11 +502,17 @@ class FlashBrainReActAgent:
                             if isinstance(content, list):
                                 # Convert list to string
                                 content = '\n'.join([str(item) for item in content])
-                            
+
+                            # Skip if we've already seen this exact content
+                            if content in seen_content:
+                                continue
+
+                            seen_content.add(content)
+
                             # Check if human input is required by detecting JSON signal
                             requires_input = False
                             human_request = None
-                            
+
                             try:
                                 # Try to parse as JSON (in case the content is the tool output)
                                 data = json.loads(content)
@@ -524,23 +531,35 @@ class FlashBrainReActAgent:
                                             human_request = json.loads(content[start_idx:end_idx])
                                     except:
                                         pass
-                            
+
                             if requires_input and human_request:
                                 # Extract question from the structured payload
                                 question = human_request.get("question", "Please provide more information")
                                 context_info = human_request.get("context", "")
-                                
+
                                 response_content = question
                                 if context_info:
                                     response_content += f"\n\nContext: {context_info}"
-                                
-                                    yield {
-                                        'is_task_complete': False,
+
+                                yield {
+                                    'is_task_complete': False,
                                     'require_user_input': True,
                                     'content': response_content
-                                    }
+                                }
                                 # Stop streaming - wait for user response
                                 logger.info(f"Human input requested: {question}")
+                                # Save the response before stopping
+                                await self.save_message(
+                                    conversation_id=context_id,
+                                    role="ai",
+                                    content=response_content,
+                                    metadata={"client_id": client_id, "project_id": project_id}
+                                )
+                                yield {
+                                    'is_task_complete': True,
+                                    'require_user_input': True,
+                                    'content': ''
+                                }
                                 return
                             else:
                                 # Normal message
@@ -562,13 +581,13 @@ class FlashBrainReActAgent:
                 yield {
                     'is_task_complete': True,
                     'require_user_input': False,
-                    'content': final_response
+                    'content': ''  # Don't repeat content, just signal completion
                 }
             else:
                 yield {
                     'is_task_complete': True,
                     'require_user_input': False,
-                    'content': "Task completed."
+                    'content': ''
                 }
 
         except GeneratorExit:

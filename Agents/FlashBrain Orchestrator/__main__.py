@@ -98,7 +98,7 @@ def main(host, port):
             push_sender=push_sender
         )
 
-        
+
         class ProjectCompletePayload(BaseModel):
             """Payload for project completion callback."""
             project_id: str
@@ -107,11 +107,69 @@ def main(host, port):
             result: Optional[dict] = None
             error: Optional[str] = None
 
+        class ChatStreamRequest(BaseModel):
+            """Request payload for chat streaming endpoint."""
+            message: str
+            conversation_id: str = "default"
+            client_id: Optional[str] = None
+            project_id: Optional[str] = None
+
         server = A2AStarletteApplication(
             agent_card=agent_card,
             http_handler=request_handler
         )
-        
+
+        # Define chat streaming endpoint for direct frontend access
+        async def handle_chat_stream(request):
+            """
+            Direct streaming endpoint for frontend clients.
+            Bypasses A2A protocol for real-time chatbot interaction.
+            """
+            import json
+            from starlette.responses import StreamingResponse
+
+            try:
+                # Parse request
+                body = await request.json()
+                chat_request = ChatStreamRequest(**body)
+
+                logger.info(f"Chat stream request: conversation_id={chat_request.conversation_id}, client_id={chat_request.client_id}")
+
+                # Stream generator
+                async def event_generator():
+                    try:
+                        async for event in flashbrain_agent.stream(
+                            query=chat_request.message,
+                            context_id=chat_request.conversation_id,
+                            client_id=chat_request.client_id,
+                            project_id=chat_request.project_id
+                        ):
+                            # Send as Server-Sent Events format
+                            yield f"data: {json.dumps(event)}\n\n"
+                    except Exception as e:
+                        logger.error(f"Stream error: {e}", exc_info=True)
+                        error_event = {
+                            'is_task_complete': True,
+                            'require_user_input': False,
+                            'content': f"Error: {str(e)}"
+                        }
+                        yield f"data: {json.dumps(error_event)}\n\n"
+
+                return StreamingResponse(
+                    event_generator(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"  # Disable nginx buffering
+                    }
+                )
+
+            except Exception as e:
+                logger.error(f"Chat stream endpoint error: {e}", exc_info=True)
+                from starlette.responses import JSONResponse
+                return JSONResponse({"error": str(e)}, status_code=500)
+
         # Define callback endpoint handler for async job completion
         async def handle_project_complete(request):
             """
@@ -150,9 +208,12 @@ def main(host, port):
                 from starlette.responses import JSONResponse
                 return JSONResponse({"error": str(e)}, status_code=500)
         
-        # Build the Starlette app and add custom route
+        # Build the Starlette app and add custom routes
         starlette_app = server.build()
         from starlette.routing import Route
+        starlette_app.routes.append(
+            Route("/chat/stream", handle_chat_stream, methods=["POST"])
+        )
         starlette_app.routes.append(
             Route("/callbacks/project-complete", handle_project_complete, methods=["POST"])
         )
