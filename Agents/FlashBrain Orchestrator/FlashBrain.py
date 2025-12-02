@@ -37,8 +37,6 @@ from available_agents import AGENTS_URLS
 from a2a.client import A2ACardResolver
 from remote_agent_connections import RemoteAgentConnections
 
-from psycopg_pool import AsyncConnectionPool
-
 # Create A2A message
 
 from a2a.types import (
@@ -88,23 +86,26 @@ class FlashBrainReActAgent:
     ):
         """
         Initialize the FlashBrain ReAct Agent.
-        
+
         Args:
             supabase_url: Supabase project URL (or from SUPABASE_URL env)
             supabase_key: Supabase service role key (or from SUPABASE_SERVICE_ROLE_KEY env)
-            postgres_connection: PostgreSQL connection string (or from SUPABASE_TRANSACTION_POOLER env)
+            postgres_connection: PostgreSQL connection string (from SUPABASE_POOLER env)
         """
         logger.info("Initializing FlashBrain ReAct Agent")
-        
+
         # Configuration
         self.supabase_url = supabase_url or os.getenv("SUPABASE_URL")
         self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        # Use SUPABASE_POOLER for checkpointer connection
         self.postgres_connection = postgres_connection or os.getenv("SUPABASE_TRANSACTION_POOLER")
         self.supabase_client = None
         self.remote_agent_connections = {} # {card name: RemoteAgentConneciton}
         self.cards = {} # {card name: AgentCard}
         self.agents = None
         self.tools = []
+        self.checkpointer = None  # Store checkpointer to keep it alive
+        self.checkpointer_cm = None  # Store context manager for cleanup
         
         # Initialize Supabase client for conversation persistence
         if self.supabase_url and self.supabase_key:
@@ -155,6 +156,17 @@ class FlashBrainReActAgent:
         Close resources and cleanup connections.
         Call this on server shutdown to prevent connection leaks.
         """
+        if self.checkpointer_cm and self.checkpointer:
+            try:
+                # Exit the async context manager properly
+                await self.checkpointer_cm.__aexit__(None, None, None)
+                logger.info("PostgreSQL checkpointer closed")
+            except Exception as e:
+                logger.error(f"Failed to close checkpointer: {e}")
+            finally:
+                self.checkpointer = None
+                self.checkpointer_cm = None
+        
         if hasattr(self, 'pool') and self.pool:
             try:
                 await self.pool.close()
@@ -316,51 +328,15 @@ class FlashBrainReActAgent:
         # Initialize PostgreSQL checkpointer for state persistence
         if not self.postgres_connection:
             raise RuntimeError(
-                "SUPABASE_TRANSACTION_POOLER environment variable is required. "
+                "SUPABASE_POOLER environment variable is required. "
                 "FlashBrain cannot run without persistent state storage."
             )
 
-        try:
-            
-
-            # Cloud Run optimized connection pool settings
-            # Increased max_size and max_waiting for test environment
-            pool = AsyncConnectionPool(
-                conninfo=self.postgres_connection,
-                max_size=10,  # Increased to 10 to prevent exhaustion during dev/testing
-                min_size=0,
-                kwargs={
-                    "autocommit": True,
-                    "prepare_threshold": None,
-                    "connect_timeout": 20,
-                    "keepalives": 1,
-                    "keepalives_idle": 10,
-                    "keepalives_interval": 5,
-                    "keepalives_count": 3,
-                },
-                open=False,
-                timeout=20.0,
-                max_waiting=20,  # Allow more queued requests
-                max_idle=30.0,   # Recycle idle connections quickly
-                max_lifetime=300.0, # Close connections after 5 mins to prevent leaks
-                reconnect_timeout=10.0,
-                check=AsyncConnectionPool.check_connection,
-                reset=False,
-            )
-            
-            await pool.open()
-            logger.info(f"PostgreSQL connection pool opened ({pool.min_size}-{pool.max_size} connections)")
-            
-            # Store pool reference for cleanup
-            self.pool = pool
-            
-            checkpointer = AsyncPostgresSaver(pool)
-            await checkpointer.setup()
-            logger.info("AsyncPostgresSaver checkpointer initialized")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize PostgreSQL checkpointer: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to initialize checkpointer: {e}") from e
+        # Create async checkpointer - from_conn_string returns an async context manager
+        # We need to enter it to get the actual checkpointer instance
+        self.checkpointer_cm = AsyncPostgresSaver.from_conn_string(self.postgres_connection)
+        self.checkpointer = await self.checkpointer_cm.__aenter__()
+        await self.checkpointer.setup()
         
         # Create the ReAct agent - this is the magic!
         # LangGraph handles all the complexity of tool calling, retries, and state management
@@ -368,7 +344,7 @@ class FlashBrainReActAgent:
         agent = create_agent(
             self.llm,
             tools=self.tools,
-            checkpointer=checkpointer
+            checkpointer=self.checkpointer
         )
         
         logger.info("ReAct agent created successfully")
@@ -482,6 +458,10 @@ class FlashBrainReActAgent:
             
             final_response = ""
             seen_content = set()  # Track already-yielded content to avoid duplicates
+
+            # Log pool stats before streaming
+            if hasattr(self, 'pool'):
+                logger.info(f"Connection pool stats: size={self.pool._nconns}, available={self.pool._pool.qsize()}, max={self.pool.max_size}")
 
             # Stream from the ReAct agent
             async for event in self.graph.astream(
@@ -705,4 +685,3 @@ async def test():
 
 if __name__ == "__main__":
     asyncio.run(test())
-
