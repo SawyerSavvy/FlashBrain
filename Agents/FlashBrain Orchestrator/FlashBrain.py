@@ -336,7 +336,27 @@ class FlashBrainReActAgent:
         # We need to enter it to get the actual checkpointer instance
         self.checkpointer_cm = AsyncPostgresSaver.from_conn_string(self.postgres_connection)
         self.checkpointer = await self.checkpointer_cm.__aenter__()
-        await self.checkpointer.setup()
+        
+        # Setup checkpointer - handle the case where prepared statements already exist
+        # This happens because setup() creates prepared statements and isn't fully idempotent
+        # The error occurs when setup() is called multiple times, even in the same process
+        try:
+            await self.checkpointer.setup()
+            logger.info("Checkpointer setup completed successfully")
+        except Exception as e:
+            # Catch "prepared statement already exists" errors - this means setup was already done
+            error_msg = str(e).lower()
+            if "prepared statement" in error_msg and "already exists" in error_msg:
+                # Setup was already done (probably by a previous initialization attempt)
+                # This is safe to ignore - the tables and statements already exist
+                logger.info(f"Checkpointer already initialized (prepared statements exist): {error_msg[:100]}")
+            elif "already exists" in error_msg:
+                # Other "already exists" errors (like tables) are also safe to ignore
+                logger.info(f"Checkpointer already initialized: {error_msg[:100]}")
+            else:
+                # Re-raise if it's a different error (connection issues, etc.)
+                logger.error(f"Checkpointer setup failed with unexpected error: {e}")
+                raise
         
         # Create the ReAct agent - this is the magic!
         # LangGraph handles all the complexity of tool calling, retries, and state management
