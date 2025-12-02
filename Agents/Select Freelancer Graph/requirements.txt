@@ -2,11 +2,13 @@
 a2a-sdk[http-server]>=0.3.16  # Official Google A2A SDK
 httpx>=0.24.0
 uvicorn>=0.23.0
+starlette>=0.27.0  # Web framework (used by uvicorn and A2A server)
 click>=8.1.0
 pydantic>=2.0.0
 
 # LangChain and LangGraph
 langgraph>=1.0.3
+langchain>=0.3.15  # Required for langchain.agents.create_agent
 langchain-core>=1.0.7
 langchain-google-genai>=3.1.0
 langchain-google-vertexai>=3.0.3

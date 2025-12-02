@@ -2,6 +2,7 @@
 a2a-sdk[http-server]>=0.3.16  # Official Google A2A SDK with HTTP server support
 httpx>=0.24.0
 uvicorn>=0.23.0
+starlette>=0.27.0  # Web framework (used by uvicorn and A2A server, explicitly required by __main__.py)
 click>=8.1.0
 pydantic>=2.0.0
 

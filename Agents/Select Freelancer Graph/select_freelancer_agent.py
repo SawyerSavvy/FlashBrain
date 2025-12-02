@@ -1,19 +1,29 @@
-from typing import Annotated, List, Literal, Optional, TypedDict, Union, Dict, Any
+"""
+Select Freelancer ReAct Agent
+
+A simplified ReAct agent for managing freelancers and project roles.
+Supports full CRUD operations: Create, Read, Update, Delete.
+
+Architecture:
+    - Uses LangChain's create_agent() for automatic ReAct loop
+    - Tools for all freelancer/role operations
+    - LLM naturally maps user intent to correct operations
+    - Much simpler than custom graph pipeline
+"""
+
+from typing import Optional, List, Dict, Any
 import os
 import json
 import requests
 from dotenv import load_dotenv
+import logging
 
 load_dotenv(override=True)
 
-from langgraph.graph import StateGraph, END, START
-from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import BaseModel, Field
-
-# --- A2A Integration ---
-from a2a.types import AgentCard, AgentSkill
 
 try:
     from supabase import create_client, Client
@@ -22,427 +32,810 @@ except ImportError:
     create_client = None
     Client = None
 
-# --- State Definition ---
-class SelectFreelancerState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
-    project_id: str
-    client_id: str
-    extracted_updates: Optional[Dict[str, Any]]
-    api_response: Optional[str]
-    existing_phases: List[Dict[str, Any]]
-    existing_roles: List[Dict[str, Any]]
-    reasoning: Optional[str]
-    error: Optional[bool]
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# --- Pydantic Models for Structured Output ---
-class PhaseUpdate(BaseModel):
-    phase_id: Optional[str] = Field(None, description="UUID of the phase if known, else None")
-    phase_title: Optional[str] = Field(None, description="Title of the phase")
-    description: Optional[str] = Field(None, description="Description of the phase")
-    tasks: Optional[List[str]] = Field(None, description="List of tasks in the phase")
+# --- System Prompt ---
+SYSTEM_PROMPT = """You are a Project Role Management Assistant.
 
-class RoleUpdate(BaseModel):
-    id: Optional[str] = Field(None, description="UUID of the unique role record if known, else None")
-    phase_id: Optional[str] = Field(None, description="UUID of the phase this role belongs to")
-    role_name: Optional[str] = Field(None, description="Name of the role")
-    role_id: Optional[str] = Field(None, description="UUID of the role if known, else None")
-    role_slot: Optional[str] = Field(None, description="Slot of the role")
-    description: Optional[str] = Field(None, description="Detailed description of the role")
-    role_skills: Optional[List[str]] = Field(None, description="List of required skills")
-    budget_pct: Optional[float] = Field(None, description="Budget percentage for this role")
+You help users manage project phases and roles with these capabilities:
+- **Add role slots** to project phases
+- **Update role requirements** (skills, budget, description, specialized name)
+- **Assign freelancers** to role slots (set freelancer_id)
+- **Remove role slots** from project
+- **Get role information** (requirements, assignments)
+- **Get phase information** (phase details, tasks)
+- **Update phase details** (title, description, tasks, budget)
+- **Match freelancers** to roles using AI matching service
 
-class RequirementsOutput(BaseModel):
-    phases: Optional[List[PhaseUpdate]] = Field(default_factory=list, description="List of phase updates")
-    roles: Optional[List[RoleUpdate]] = Field(default_factory=list, description="List of role updates")
-    reasoning: str = Field(..., description="Explanation of the changes made, citing specific user requests and existing state context.")
+When the user asks to do something, use the appropriate tool. Be conversational and helpful.
 
-# --- Node 0: Fetch Project Data ---
+Important: You work with project_phases and project_phase_roles tables ONLY.
+You cannot create or modify freelancers themselves (they exist in a separate system).
+
+Examples:
+- "Add a Backend Developer role to Phase 1" → use add_role_slot
+- "The Security Engineer needs AI experience" → use update_role_requirements
+- "Assign freelancer abc-123 to the Backend Developer role" → use assign_freelancer_to_role
+- "What skills does the Security Engineer role need?" → use get_role_info
+- "Find freelancers for this project" → use match_freelancers
+"""
 
 
-class SelectFreelancerAgent:
+class SelectFreelancerReActAgent:
+    """
+    Simplified Select Freelancer agent using create_agent.
 
-    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
+    Replaces the complex 4-node pipeline with a ReAct agent that
+    intelligently chooses tools based on user requests.
+    """
+
+    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain', 'application/json']
 
     def __init__(self):
-        self.graph = self._build_graph()
+        """Initialize the ReAct agent with tools."""
+        logger.info("Initializing Select Freelancer ReAct Agent")
 
-    def _build_graph(self):
-        workflow = StateGraph(SelectFreelancerState)
+        # Initialize Supabase client
+        self.supabase_url = os.getenv("SUPABASE_URL")
+        self.supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        self.supabase_client = None
 
-        workflow.add_node("fetch_project_data", self.fetch_project_data)
-        workflow.add_node("extract_requirements", self.extract_requirements)
-        workflow.add_node("upload_to_supabase", self.upload_to_supabase)
-        workflow.add_node("call_freelancer_service", self.call_freelancer_service)
+        if self.supabase_url and self.supabase_key and create_client:
+            try:
+                self.supabase_client = create_client(self.supabase_url, self.supabase_key)
+                logger.info("Supabase client initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Supabase client: {e}")
 
-        workflow.add_edge(START, "fetch_project_data")
-        workflow.add_edge("fetch_project_data", "extract_requirements")
-        workflow.add_edge("extract_requirements", "upload_to_supabase")
-        workflow.add_edge("upload_to_supabase", "call_freelancer_service")
-        workflow.add_edge("call_freelancer_service", END)
+        # Initialize LLM
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.1
+        )
 
-        return workflow.compile()
+        # Create tools
+        self.tools = self._create_tools()
 
-    # --- Node 0: Fetch Project Data ---
-    def fetch_project_data(self, state: SelectFreelancerState) -> Dict[str, Any]:
-        """
-        Fetches existing project phases and roles from Supabase.
-        """
-        project_id = state.get("project_id")
-        client_id = state.get("client_id")
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        
-        if not project_id or not supabase_url or not supabase_key or not create_client:
-            return {"messages": AIMessage(content="Supabase not configured or unavailable."), "existing_phases": [], "existing_roles": []}
-            
-        try:
-            supabase: Client = create_client(supabase_url, supabase_key)
-            
-            # Fetch Phases (excluding embedding columns)
-            phases_res = supabase.table("project_phases").select(
-                "id, project_id, phase_title, phase_description, tasks, created_at, updated_at, "
-                "phase_number, phase_budget_pct, predicted_time_weeks, predicted_time_hours, "
-                "predicted_time_months, task_times, duration_quantiles"
-            ).eq("project_id", project_id).execute()
-            existing_phases = phases_res.data if phases_res.data else []
-            
-            # Fetch Roles (excluding embedding columns)
-            # Join with roles table to get the role name
-            roles_res = supabase.table("project_phase_roles").select(
-                "id, project_id, phase_id, role_id, role_slot, supplied_by, freelancer_id, "
-                "can_span_phases, created_at, updated_at, role_skills, role_description, "
-                "specialized_role_name, role_budget_pct_phase, role_time_weeks, role_week_hours, "
-                "skill_relevance_scores, pre_selection_freelancer_ids, pre_selection_scores, "
-                "pre_selection_k, pre_selection_updated_at, recommended_freelancers, roles(name)"
-            ).eq("project_id", project_id).execute()
-            
-            existing_roles = []
-            if roles_res.data:
-                for r in roles_res.data:
-                    # Flatten the role name
-                    role_data = r.copy()
-                    if "roles" in role_data and role_data["roles"]:
-                        role_data["role_name"] = role_data["roles"].get("name")
-                        del role_data["roles"] # Clean up nested object
-                    existing_roles.append(role_data)
-            
-            return {"existing_phases": existing_phases, "existing_roles": existing_roles}
-            
-        except Exception as e:
-            return {"messages": AIMessage(content="Failed to fetch project data."), "error": True, "existing_phases": [], "existing_roles": []}
+        # Create ReAct agent using create_agent
+        self.graph = create_agent(
+            model=self.llm,
+            tools=self.tools,
+            system_prompt=SYSTEM_PROMPT
+        )
 
-    # --- Node 1: Extract Requirements ---
-    def extract_requirements(self, state: SelectFreelancerState) -> Dict[str, Any]:
-        """
-        Extracts freelancer role requirements and phase details from the conversation.
-        """
-        messages = state["messages"]
-        conversation_history = ""
-        for msg in messages:
-            role = "User" if isinstance(msg, HumanMessage) else "AI"
-            if isinstance(msg, SystemMessage):
-                role = "System"
-            conversation_history += f"{role}: {msg.content}\n"
-        
-        project_id = state.get("project_id", "Unknown")
-        existing_phases = state.get("existing_phases", [])
-        existing_roles = state.get("existing_roles", [])
-        
-        # Format existing state for the prompt
-        existing_state_str = json.dumps({
-            "phases": existing_phases,
-            "roles": existing_roles
-        }, indent=2, default=str)
-        
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
-        structured_llm = llm.with_structured_output(RequirementsOutput)
-        
-        prompt = f"""
-        Analyze the following conversation history and extract updates for project phases and freelancer roles (Project ID: {project_id}).
-        
-        Current Project State:
-        {existing_state_str}
-        
-        Compare the conversation request with the Current Project State.
-        Identify what needs to be ADDED or UPDATED. If there are no updates, return empty phases and roles lists. 
+        logger.info(f"ReAct agent created with {len(self.tools)} tools")
 
-        Only return the fields that are being updated. Do not return fields that are not being updated. For example, if the descritipion is not being changed, it should not be returned. 
+    def _create_tools(self) -> List:
+        """Create all tools for project role management."""
+        return [
+            self._create_add_role_slot_tool(),
+            self._create_update_role_requirements_tool(),
+            self._create_remove_role_slot_tool(),
+            self._create_get_all_roles_tool(),
+            self._create_get_role_info_tool(),
+            self._create_get_phase_info_tool(),
+            self._create_get_project_data_tool(),
+            self._create_update_phase_tool(),
+            self._create_match_freelancers_tool(),
+        ]
 
-        Provide a clear reasoning for your decisions.
-        
-        Conversation History:
-        {conversation_history}
-        """
-        
-        try:
-            response = structured_llm.invoke(prompt)
+    # --- Tool Definitions ---
 
-            # response is an instance of RequirementsOutput
-            extracted_updates = response.model_dump()
-            reasoning = extracted_updates.pop("reasoning", "")
-            
-            return {"extracted_updates": extracted_updates, "reasoning": reasoning}
-        except Exception as e:
-            return {"extracted_updates": {"phases": [], "roles": []}, "reasoning": f"Error: {e}"}
+    def _create_add_role_slot_tool(self):
+        """Tool for adding a new role slot to a phase."""
+        supabase = self.supabase_client
 
-    # --- Node 2: Upload to Supabase ---
-    def upload_to_supabase(self, state: SelectFreelancerState) -> Dict[str, Any]:
-        """
-        Updates project_phases and project_phase_roles in Supabase.
-        """
-        extracted_updates = state.get("extracted_updates", {})
-        phases = extracted_updates.get("phases", [])
-        roles = extracted_updates.get("roles", [])
-        project_id = state.get("project_id")
-        
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        
-        if not supabase_url or not supabase_key or not create_client:
-            return {"error": "Supabase not configured or unavailable."}
-            
-        try:
-            supabase: Client = create_client(supabase_url, supabase_key)
-            
-            # Update Phases
-            for phase in phases:
-                phase_id = phase.get("phase_id")
-                phase_title = phase.get("phase_title")
-                
-                # If we don't have phase_id, try to find it by title and project_id
-                if not phase_id and phase_title and project_id:
-                    res = supabase.table("project_phases").select("id").eq("project_id", project_id).eq("phase_title", phase_title).execute()
-                    if res.data:
-                        phase_id = res.data[0]["id"]
-                
+        @tool
+        def add_role_slot(
+            project_id: str,
+            phase_id: str,
+            role_id: str,
+            role_slot: int,
+            role_skills: Optional[List[str]] = None,
+            role_description: Optional[str] = None,
+            specialized_role_name: Optional[str] = None,
+            role_budget_pct_phase: Optional[float] = None,
+            supplied_by: str = "platform"
+        ) -> str:
+            """
+            Add a new role slot to a project phase.
+
+            Args:
+                project_id: UUID of the project
+                phase_id: UUID of the phase
+                role_id: UUID of the role type (from roles table)
+                role_slot: Slot number for this role (e.g., 1 for first Backend Developer)
+                role_skills: List of required skills (optional)
+                role_description: Description of the role requirements (optional)
+                specialized_role_name: Specialized name for this role slot (optional)
+                role_budget_pct_phase: Budget percentage within phase (optional)
+                supplied_by: Who supplies this role - 'client' or 'platform' (default: platform)
+
+            Returns:
+                Confirmation message with role slot ID
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                insert_data = {
+                    "project_id": project_id,
+                    "phase_id": phase_id,
+                    "role_id": role_id,
+                    "role_slot": role_slot,
+                    "supplied_by": supplied_by
+                }
+
+                # Add optional fields
+                if role_skills:
+                    insert_data["role_skills"] = role_skills
+                if role_description:
+                    insert_data["role_description"] = {"description": role_description}
+                if specialized_role_name:
+                    insert_data["specialized_role_name"] = specialized_role_name
+                if role_budget_pct_phase is not None:
+                    insert_data["role_budget_pct_phase"] = role_budget_pct_phase
+
+                result = supabase.table("project_phase_roles").insert(insert_data).execute()
+
+                role_slot_id = result.data[0]['id'] if result.data else "unknown"
+                return f"✅ Added role slot #{role_slot} with ID {role_slot_id}. Skills: {', '.join(role_skills) if role_skills else 'Not specified'}"
+
+            except Exception as e:
+                logger.error(f"Failed to add role slot: {e}")
+                return f"❌ Failed to add role slot: {str(e)}"
+
+        return add_role_slot
+
+    def _create_update_role_requirements_tool(self):
+        """Tool for updating role requirements."""
+        supabase = self.supabase_client
+
+        @tool
+        def update_role_requirements(
+            role_slot_id: str,
+            role_skills: Optional[List[str]] = None,
+            role_description: Optional[str] = None,
+            specialized_role_name: Optional[str] = None,
+            role_budget_pct_phase: Optional[float] = None,
+            role_time_weeks: Optional[float] = None,
+            role_week_hours: Optional[float] = None
+        ) -> str:
+            """
+            Update requirements for a project role slot.
+
+            Args:
+                role_slot_id: UUID of the project_phase_roles record
+                role_skills: List of required skills (optional)
+                role_description: Description of the role (optional)
+                specialized_role_name: Specialized name for this role (optional)
+                role_budget_pct_phase: Budget percentage for this role (optional)
+                role_time_weeks: Estimated time in weeks (optional)
+                role_week_hours: Hours per week (optional)
+
+            Returns:
+                Confirmation message
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            # Build update dict (only non-None values)
+            update_data = {}
+            if role_skills is not None:
+                update_data["role_skills"] = role_skills
+            if role_description is not None:
+                update_data["role_description"] = {"description": role_description}
+            if specialized_role_name is not None:
+                update_data["specialized_role_name"] = specialized_role_name
+            if role_budget_pct_phase is not None:
+                update_data["role_budget_pct_phase"] = role_budget_pct_phase
+            if role_time_weeks is not None:
+                update_data["role_time_weeks"] = role_time_weeks
+            if role_week_hours is not None:
+                update_data["role_week_hours"] = role_week_hours
+
+            if not update_data:
+                return "No updates provided"
+
+            try:
+                supabase.table("project_phase_roles").update(update_data).eq("id", role_slot_id).execute()
+
+                updates = ", ".join([f"{k}={v}" for k, v in update_data.items()])
+                return f"✅ Updated role requirements: {updates}"
+
+            except Exception as e:
+                logger.error(f"Failed to update role: {e}")
+                return f"❌ Failed to update role: {str(e)}"
+
+        return update_role_requirements
+
+    def _create_remove_role_slot_tool(self):
+        """Tool for removing a role slot."""
+        supabase = self.supabase_client
+
+        @tool
+        def remove_role_slot(role_slot_id: str) -> str:
+            """
+            Remove a role slot from a project phase.
+
+            Args:
+                role_slot_id: UUID of the project_phase_roles record to remove
+
+            Returns:
+                Confirmation message
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                supabase.table("project_phase_roles").delete().eq("id", role_slot_id).execute()
+                return f"✅ Removed role slot {role_slot_id}"
+
+            except Exception as e:
+                logger.error(f"Failed to remove role slot: {e}")
+                return f"❌ Failed to remove role slot: {str(e)}"
+
+        return remove_role_slot
+
+    def _create_assign_freelancer_tool(self):
+        """Tool for assigning a freelancer to a role slot."""
+        supabase = self.supabase_client
+
+        @tool
+        def assign_freelancer_to_role(
+            role_slot_id: str,
+            freelancer_id: str
+        ) -> str:
+            """
+            Assign a freelancer to a specific role slot.
+
+            Args:
+                role_slot_id: UUID of the project_phase_roles record
+                freelancer_id: UUID of the freelancer to assign
+
+            Returns:
+                Confirmation message
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                supabase.table("project_phase_roles").update({
+                    "freelancer_id": freelancer_id
+                }).eq("id", role_slot_id).execute()
+
+                return f"✅ Assigned freelancer {freelancer_id} to role slot {role_slot_id}"
+
+            except Exception as e:
+                logger.error(f"Failed to assign freelancer: {e}")
+                return f"❌ Failed to assign freelancer: {str(e)}"
+
+        return assign_freelancer_to_role
+
+    def _create_get_phase_info_tool(self):
+        """Tool for getting phase information."""
+        supabase = self.supabase_client
+
+        @tool
+        def get_phase_info(project_id: str, phase_id: Optional[str] = None) -> str:
+            """
+            Get information about project phases.
+
+            Args:
+                project_id: UUID of the project
+                phase_id: UUID of specific phase (optional, returns all if not provided)
+
+            Returns:
+                Phase information as JSON string
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                query = supabase.table("project_phases").select(
+                    "id, phase_title, phase_description, tasks, phase_number, "
+                    "phase_budget_pct, predicted_time_weeks, predicted_time_hours, "
+                    "predicted_time_months, approval_status, created_at, updated_at"
+                ).eq("project_id", project_id)
+
                 if phase_id:
-                    update_data = {}
-                    if phase.get("description"):
-                        update_data["phase_description"] = phase.get("description")
-                    if phase.get("tasks"):
-                        # Convert list of strings to jsonb structure if needed, or just store as is if schema allows
-                        # Schema says tasks is jsonb. Assuming simple list is okay or dict.
-                        update_data["tasks"] = phase.get("tasks")
-                    
-                    if update_data:
-                        supabase.table("project_phases").update(update_data).eq("id", phase_id).execute()
-    
-            # Update Roles
-            for role in roles:
-                record_id = role.get("id")  # The unique record ID
-                role_name = role.get("role_name")
-                phase_id = role.get("phase_id")
-                
-                # If we don't have the record id, try to find it
-                if not record_id and role_name and project_id and phase_id:
-                    # Try to find by role_name and phase_id
-                    res = supabase.table("project_phase_roles").select("id").eq("project_id", project_id).eq("phase_id", phase_id).execute()
-                    if res.data:
-                        # If multiple matches, we'd need more logic. For now just take first.
-                        record_id = res.data[0]["id"]
-    
-                if record_id:
-                    update_data = {
-                        k:v for k,v in role.items() if v is not None and k != "id"  # Exclude id from update data
+                    query = query.eq("id", phase_id)
+
+                result = query.order("phase_number").execute()
+
+                if result.data:
+                    return json.dumps(result.data, indent=2, default=str)
+                else:
+                    return f"No phases found for project {project_id}"
+
+            except Exception as e:
+                logger.error(f"Failed to get phase info: {e}")
+                return f"❌ Error: {str(e)}"
+
+        return get_phase_info
+
+    def _create_update_phase_tool(self):
+        """Tool for updating phase details."""
+        supabase = self.supabase_client
+
+        @tool
+        def update_phase(
+            phase_id: str,
+            phase_title: Optional[str] = None,
+            phase_description: Optional[str] = None,
+            tasks: Optional[List[str]] = None,
+            phase_budget_pct: Optional[float] = None
+        ) -> str:
+            """
+            Update details of a project phase.
+
+            Args:
+                phase_id: UUID of the phase
+                phase_title: New title for the phase (optional)
+                phase_description: New description (optional)
+                tasks: New list of tasks (optional)
+                phase_budget_pct: Budget percentage for this phase (optional)
+
+            Returns:
+                Confirmation message
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            # Build update dict
+            update_data = {}
+            if phase_title is not None:
+                update_data["phase_title"] = phase_title
+            if phase_description is not None:
+                update_data["phase_description"] = phase_description
+            if tasks is not None:
+                update_data["tasks"] = tasks
+            if phase_budget_pct is not None:
+                update_data["phase_budget_pct"] = phase_budget_pct
+
+            if not update_data:
+                return "No updates provided"
+
+            try:
+                supabase.table("project_phases").update(update_data).eq("id", phase_id).execute()
+
+                updates = ", ".join([f"{k}={v}" for k, v in update_data.items()])
+                return f"✅ Updated phase: {updates}"
+
+            except Exception as e:
+                logger.error(f"Failed to update phase: {e}")
+                return f"❌ Failed to update phase: {str(e)}"
+
+        return update_phase
+
+    def _create_get_all_roles_tool(self):
+        """Tool for getting all available roles from the roles table."""
+        supabase = self.supabase_client
+
+        @tool
+        def get_all_roles() -> str:
+            """
+            Get all available roles from the roles table.
+
+            Returns:
+                List of all roles with their IDs, names, and industries as JSON string
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                result = supabase.table("roles").select("id, name, Industry").execute()
+
+                if result.data:
+                    return json.dumps(result.data, indent=2, default=str)
+                else:
+                    return "No roles found in the roles table"
+
+            except Exception as e:
+                logger.error(f"Failed to get roles: {e}")
+                return f"❌ Error: {str(e)}"
+
+        return get_all_roles
+
+    def _create_get_role_info_tool(self):
+        """Tool for getting role information."""
+        supabase = self.supabase_client
+
+        @tool
+        def get_role_info(project_id: str, phase_id: Optional[str] = None) -> str:
+            """
+            Get information about project roles.
+
+            Args:
+                project_id: UUID of the project
+                phase_id: UUID of specific phase (optional, returns all if not provided)
+
+            Returns:
+                Role information as JSON string
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                query = supabase.table("project_phase_roles").select(
+                    "id, phase_id, role_id, role_skills, role_description, "
+                    "role_budget_pct_phase, freelancer_id, roles(name)"
+                ).eq("project_id", project_id)
+
+                if phase_id:
+                    query = query.eq("phase_id", phase_id)
+
+                result = query.execute()
+
+                if result.data:
+                    # Flatten role name
+                    roles = []
+                    for r in result.data:
+                        role_data = r.copy()
+                        if "roles" in role_data and role_data["roles"]:
+                            role_data["role_name"] = role_data["roles"].get("name")
+                            del role_data["roles"]
+                        roles.append(role_data)
+
+                    return json.dumps(roles, indent=2, default=str)
+                else:
+                    return f"No roles found for project {project_id}"
+
+            except Exception as e:
+                logger.error(f"Failed to get role info: {e}")
+                return f"❌ Error: {str(e)}"
+
+        return get_role_info
+
+    def _create_get_project_data_tool(self):
+        """Tool for getting comprehensive project data."""
+        supabase = self.supabase_client
+
+        @tool
+        def get_project_data(
+            project_id: str,
+            client_id: Optional[str] = None,
+            phase_id: Optional[str] = None,
+            role_slot_id: Optional[str] = None
+        ) -> str:
+            """
+            Get comprehensive project data including phases, roles, and project report.
+
+            This retrieves:
+            - final_project_report from project_decomposition
+            - All project_phases (or specific phase if phase_id provided)
+            - All project_phase_roles (filtered by phase_id or role_slot_id if provided)
+
+            Args:
+                project_id: UUID of the project (required)
+                client_id: UUID of the client (optional, for validation)
+                phase_id: UUID of specific phase to filter (optional)
+                role_slot_id: UUID of specific role slot (optional)
+
+            Returns:
+                Comprehensive project data as JSON
+            """
+            if not supabase:
+                return "Error: Supabase not configured"
+
+            try:
+                result = {
+                    "project_id": project_id,
+                    "final_project_report": None,
+                    "phases": [],
+                    "role_slots": []
+                }
+
+                # 1. Get final_project_report from project_decomposition
+                project_decomp = supabase.table("project_decomposition").select(
+                    "final_project_report, project_name, project_topic, project_budget, "
+                    "predicted_cost, status, select_freelancer_status"
+                ).eq("project_id", project_id)
+
+                if client_id:
+                    project_decomp = project_decomp.eq("client_id", client_id)
+
+                project_result = project_decomp.execute()
+
+                if project_result.data:
+                    result["final_project_report"] = project_result.data[0].get("final_project_report")
+                    result["project_name"] = project_result.data[0].get("project_name")
+                    result["project_topic"] = project_result.data[0].get("project_topic")
+                    result["project_budget"] = project_result.data[0].get("project_budget")
+                    result["predicted_cost"] = project_result.data[0].get("predicted_cost")
+                    result["status"] = project_result.data[0].get("status")
+                    result["select_freelancer_status"] = project_result.data[0].get("select_freelancer_status")
+
+                # 2. Get project_phases
+                phases_query = supabase.table("project_phases").select(
+                    "id, phase_title, phase_description, tasks, phase_number, "
+                    "phase_budget_pct, predicted_time_weeks, predicted_time_hours, "
+                    "approval_status"
+                ).eq("project_id", project_id)
+
+                if phase_id:
+                    phases_query = phases_query.eq("id", phase_id)
+
+                phases_result = phases_query.order("phase_number").execute()
+
+                if phases_result.data:
+                    result["phases"] = phases_result.data
+
+                # 3. Get project_phase_roles
+                roles_query = supabase.table("project_phase_roles").select(
+                    "id, phase_id, role_id, role_slot, freelancer_id, "
+                    "role_skills, role_description, specialized_role_name, "
+                    "role_budget_pct_phase, role_time_weeks, role_week_hours, "
+                    "supplied_by, pre_selection_freelancer_ids, recommended_freelancers, "
+                    "roles(name)"
+                ).eq("project_id", project_id)
+
+                if phase_id:
+                    roles_query = roles_query.eq("phase_id", phase_id)
+
+                if role_slot_id:
+                    roles_query = roles_query.eq("id", role_slot_id)
+
+                roles_result = roles_query.execute()
+
+                if roles_result.data:
+                    # Flatten role name
+                    role_slots = []
+                    for r in roles_result.data:
+                        role_data = r.copy()
+                        if "roles" in role_data and role_data["roles"]:
+                            role_data["role_name"] = role_data["roles"].get("name")
+                            del role_data["roles"]
+                        role_slots.append(role_data)
+
+                    result["role_slots"] = role_slots
+
+                return json.dumps(result, indent=2, default=str)
+
+            except Exception as e:
+                logger.error(f"Failed to get project data: {e}")
+                return f"❌ Error: {str(e)}"
+
+        return get_project_data
+
+    def _create_match_freelancers_tool(self):
+        """Tool for matching freelancers using external service."""
+
+        @tool
+        def match_freelancers(
+            project_id: str,
+            phase_ids: Optional[List[str]] = None,
+            role_ids: Optional[List[str]] = None,
+            max_results: int = 20
+        ) -> str:
+            """
+            Find and recommend freelancers for project roles using AI matching.
+
+            Args:
+                project_id: UUID of the project
+                phase_ids: List of phase IDs to re-optimize (optional)
+                role_ids: List of role IDs to re-optimize (optional)
+                max_results: Maximum number of results per role
+
+            Returns:
+                Matching results
+            """
+            service_url = os.getenv("SELECT_FREELANCER_URL", "")
+            if not service_url:
+                return "❌ Error: SELECT_FREELANCER_URL not configured"
+
+            try:
+                if phase_ids or role_ids:
+                    # Re-optimize specific targets
+                    endpoint = f"{service_url.rstrip('/')}/reoptimize-targets"
+                    payload = {
+                        "project_id": project_id,
+                        "phase_ids": phase_ids or [],
+                        "phase_role_ids": role_ids or [],
+                        "max_results": max_results
                     }
-    
-                    if update_data:
-                        result = supabase.table("project_phase_roles").update(update_data).eq("id", record_id).execute()
-                        
-            return {}
-            
-        except Exception as e:
-            return {}
+                    action = "Re-optimization"
+                else:
+                    # Match all freelancers
+                    endpoint = f"{service_url.rstrip('/')}/match-all-freelancers"
+                    payload = {
+                        "project_id": project_id,
+                        "max_results": max_results
+                    }
+                    action = "Match all"
 
-    # --- Node 3: Call Freelancer Service ---
-    def call_freelancer_service(self, state: SelectFreelancerState) -> Dict[str, Any]:
-        """
-        Calls the Freelancer Service to match or re-optimize.
-        """
-        extracted_updates = state.get("extracted_updates", {})
-        roles = extracted_updates.get("roles", [])
-        phases = extracted_updates.get("phases", [])
-        project_id = state.get("project_id")
-        
-        service_url = os.getenv("SELECT_FREELANCER_URL", "")
-        if not service_url:
-            return {"api_response": "Error: SELECT_FREELANCER_URL not configured"}
-            
-        # Determine which endpoint to call
-        # If specific roles/phases were updated, use /reoptimize-targets
-        # Otherwise (or if explicitly requested), use /match-all-freelancers
-        
-        # Collect IDs for re-optimization
-        phase_ids = [p.get("phase_id") for p in phases if p.get("phase_id")]
-        ids = [r.get("id") for r in roles if r.get("id")]
-        
-        try:
-            if phase_ids or ids:
-                # Call /reoptimize-targets
-                endpoint = f"{service_url.rstrip('/')}/reoptimize-targets"
-                payload = {
-                    "project_id": project_id,
-                    "phase_ids": phase_ids,
-                    "phase_role_ids": ids,
-                    "max_results": 20
-                }
-                response = requests.post(endpoint, json=payload)
-                action = "Re-optimization"
-            else:
-                # Call /match-all-freelancers
-                endpoint = f"{service_url.rstrip('/')}/match-all-freelancers"
-                payload = {
-                    "project_id": project_id,
-                    "max_results": 10
-                }
-                response = requests.post(endpoint, json=payload)
-                action = "Match All"
-                
-            if response.status_code == 200:
-                return {"api_response": f"{action} successful: {response.json()}"}
-            else:
-                return {"api_response": f"{action} failed: {response.status_code} - {response.text}"}
-                
-        except Exception as e:
-            return {"api_response": f"Service call failed: {e}"}
+                response = requests.post(endpoint, json=payload, timeout=30)
 
-    async def stream(self, query: str, context_id: str = "default", project_id: str = None, client_id: str = None):
+                if response.status_code == 200:
+                    return f"✅ {action} successful: {json.dumps(response.json(), indent=2)}"
+                else:
+                    return f"❌ {action} failed: {response.status_code} - {response.text}"
+
+            except requests.Timeout:
+                return "❌ Matching service timeout"
+            except Exception as e:
+                logger.error(f"Failed to match freelancers: {e}")
+                return f"❌ Error: {str(e)}"
+
+        return match_freelancers
+
+    # --- Stream Method (for A2A protocol) ---
+
+    async def stream(
+        self,
+        query: str,
+        context_id: str = "default",
+        project_id: str = None,
+        client_id: str = None
+    ):
         """
-        Streams responses from the Select Freelancer Graph for A2A protocol.
+        Stream responses from the ReAct agent.
+
+        Args:
+            query: User's message/query
+            context_id: Conversation thread ID
+            project_id: Current project ID context
+            client_id: Client ID for authentication
 
         Yields:
-            Dict with keys:
+            Dict with streaming response data:
                 - is_task_complete: bool
                 - require_user_input: bool
                 - content: str
         """
-        messages = [HumanMessage(content=query)]
-        state = {
-            "messages": messages,
-            "project_id": project_id,
-            "client_id": client_id
-        }
-        
         config = {"configurable": {"thread_id": context_id}}
 
         try:
-            # Yield initial status
+            # Build message list with context
+            messages = [HumanMessage(content=query)]
+
+            # Add project context to messages if provided
+            context_info = []
+            if project_id:
+                context_info.append(f"project_id: {project_id}")
+            if client_id:
+                context_info.append(f"client_id: {client_id}")
+
+            if context_info:
+                messages.insert(0, SystemMessage(content=f"[Context: {', '.join(context_info)}]"))
+
+            # Stream from ReAct agent
+            final_response = ""
+
+            async for event in self.graph.astream(
+                {"messages": messages},
+                config=config,
+                stream_mode="messages"
+            ):
+                if isinstance(event, tuple):
+                    message, metadata = event
+
+                    # Only stream AI messages (not tool calls)
+                    if hasattr(message, 'content') and message.content:
+                        if not hasattr(message, 'tool_calls') or not message.tool_calls:
+                            content = message.content
+
+                            # Handle dict/list content (Gemini format)
+                            if isinstance(content, list):
+                                text_parts = []
+                                for item in content:
+                                    if isinstance(item, dict) and 'text' in item:
+                                        text_parts.append(item['text'])
+                                    elif isinstance(item, str):
+                                        text_parts.append(item)
+                                content = '\n'.join(text_parts)
+                            elif isinstance(content, dict):
+                                content = content.get('text', str(content))
+
+                            final_response = content
+                            yield {
+                                'is_task_complete': False,
+                                'require_user_input': False,
+                                'content': content
+                            }
+
+            # Final completion signal (don't repeat content - already streamed)
             yield {
-                'is_task_complete': False,
+                'is_task_complete': True,
                 'require_user_input': False,
-                'content': 'Fetching project data...'
+                'content': ""  # Empty - content already streamed above
             }
 
-            # Execute the graph with streaming
-            final_state = {}
-            for event in self.graph.stream(state, config=config, stream_updates = 'messages'):
-                for key, value in event.items():
-                    if value:
-                        final_state.update(value)
-                    
-                    if key == "fetch_project_data":
-                        yield {
-                            'is_task_complete': False,
-                            'require_user_input': False,
-                            'content': 'Analyzing project data...'
-                        }
-                    elif key == "extract_requirements":
-                        yield {
-                            'is_task_complete': False,
-                            'require_user_input': False,
-                            'content': 'Extracting requirements...'
-                        }
-                    elif key == "upload_to_supabase":
-                        yield {
-                            'is_task_complete': False,
-                            'require_user_input': False,
-                            'content': 'Updating database...'
-                        }
-                    elif key == "call_freelancer_service":
-                        yield {
-                            'is_task_complete': False,
-                            'require_user_input': False,
-                            'content': 'Finding personal...'
-                        }
-
-            extracted_updates = final_state.get("extracted_updates", {})
-            api_response = final_state.get("api_response", "")
-            error = final_state.get("error", False)
-
-            # Build response message
-            if error:
-                yield {
-                    'is_task_complete': False,
-                    'require_user_input': True,
-                    'content': f"Error occurred while processing: {api_response}"
-                }
-            elif api_response:
-                phases = extracted_updates.get("phases", [])
-                roles = extracted_updates.get("roles", [])
-                summary = f"Updated {len(phases)} phase(s) and {len(roles)} role(s). {api_response}"
-
-                yield {
-                    'is_task_complete': True,
-                    'require_user_input': False,
-                    'content': summary
-                }
-            else:
-                yield {
-                    'is_task_complete': True,
-                    'require_user_input': False,
-                    'content': "Freelancer selection completed successfully."
-                }
-
         except Exception as e:
+            logger.error(f"Stream error: {e}", exc_info=True)
             yield {
                 'is_task_complete': False,
                 'require_user_input': True,
-                'content': f"An error occurred during freelancer selection: {str(e)}"
+                'content': f"An error occurred: {str(e)}"
             }
 
-    def invoke(self, message: str, project_id: str, client_id: str = None) -> Dict[str, Any]:
+    def invoke(
+        self,
+        message: str,
+        project_id: str = None,
+        client_id: str = None
+    ) -> Dict[str, Any]:
         """
-        Invokes the Select Freelancer Graph.
+        Synchronous invocation of the agent.
+
+        Args:
+            message: User message
+            project_id: Current project ID context
+            client_id: Client ID for authentication
+
+        Returns:
+            Dict with response
         """
-        # Handle JSON payload parsing if input is a string (A2A compat)
+        # Handle JSON payload parsing
         if isinstance(message, str):
             try:
-                import json
                 parsed = json.loads(message)
                 if isinstance(parsed, dict):
                     message = parsed.get("message", message)
                     project_id = parsed.get("project_id", project_id)
                     client_id = parsed.get("client_id", client_id)
-            except:
+            except json.JSONDecodeError:
                 pass
 
         messages = [HumanMessage(content=message)]
-        state = {
-            "messages": messages,
-            "project_id": project_id
-        }
-        result = self.graph.invoke(state)
+
+        # Add context
+        if project_id or client_id:
+            context_info = []
+            if project_id:
+                context_info.append(f"project_id: {project_id}")
+            if client_id:
+                context_info.append(f"client_id: {client_id}")
+            messages.insert(0, SystemMessage(content=f"[Context: {', '.join(context_info)}]"))
+
+        result = self.graph.invoke({"messages": messages})
+
+        # Extract final AI message
+        final_message = ""
+        if result.get("messages"):
+            final_message = result["messages"][-1].content if result["messages"] else ""
+
         return {
-            "extracted_updates": result.get("extracted_updates"),
-            "api_response": result.get("api_response")
+            "response": final_message
         }
-'''
-async def test(): 
-    agent = SelectFreelancerAgent()
-    
-    test = "The Security Engineer needs to have experience in AI Agents"
+
+
+# --- Testing ---
+async def test():
+    """Test the ReAct agent."""
+    agent = SelectFreelancerReActAgent()
 
     project_id = "058ed2ae-0bd6-4fc5-8fb5-0f0319a2fcbc"
     client_id = "9a76be62-0d44-4a34-913d-08dcac008de5"
 
-    async for event in agent.stream(query = test, project_id = project_id, client_id = client_id):
-        print(event)
-'''
+    test_queries = [
+        "What roles are available in the project?",
+        "The Security Engineer needs to have experience in AI Agents",
+        "Find freelancers for all roles in this project",
+    ]
+
+    for query in test_queries:
+        print(f"\n{'='*70}")
+        print(f"Query: {query}")
+        print(f"{'='*70}\n")
+
+        async for item in agent.stream(query, project_id=project_id, client_id=client_id):
+            if item.get('content'):
+                print(item['content'], end='', flush=True)
+            if item.get('is_task_complete'):
+                print("\n[Task Complete]")
+
 
 if __name__ == "__main__":
     import asyncio
-    port = int(os.getenv("PORT", 8012))
-    print(f"Starting Select Freelancer Agent on port {port}...")
-    run_server(SelectFreelancerAgent(), port=port)
-    #asyncio.run(test())
 
+    # For A2A server deployment
+    port = int(os.getenv("PORT", 8012))
+    print(f"Starting Select Freelancer ReAct Agent on port {port}...")
+
+    from agent_executor import run_server
+    run_server(SelectFreelancerReActAgent(), port=port)
+
+    # For testing
+    # asyncio.run(test())
