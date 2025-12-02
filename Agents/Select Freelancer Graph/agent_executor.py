@@ -17,7 +17,7 @@ from a2a.utils import (
 )
 from a2a.utils.errors import ServerError
 
-from select_freelancer_agent import SelectFreelancerAgent
+from select_freelancer_agent import SelectFreelancerReActAgent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class SelectFreelancerAgentExecutor(AgentExecutor):
     """Select Freelancer AgentExecutor."""
 
     def __init__(self):
-        self.agent = SelectFreelancerAgent()
+        self.agent = SelectFreelancerReActAgent()
 
     async def execute(
         self,
