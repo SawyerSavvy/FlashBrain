@@ -211,6 +211,19 @@ def main(host, port):
         # Build the Starlette app and add custom routes
         starlette_app = server.build()
         from starlette.routing import Route
+        from starlette.responses import JSONResponse
+        
+        # Add health check endpoint (required for Cloud Run)
+        async def health_check(request):
+            """Health check endpoint for Cloud Run."""
+            return JSONResponse({
+                "status": "healthy",
+                "service": "FlashBrain Orchestrator"
+            })
+        
+        starlette_app.routes.append(
+            Route("/health", health_check, methods=["GET"])
+        )
         starlette_app.routes.append(
             Route("/chat/stream", handle_chat_stream, methods=["POST"])
         )

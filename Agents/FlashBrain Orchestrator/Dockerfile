@@ -25,9 +25,11 @@ ENV PYTHONUNBUFFERED=1
 # Expose port (documentation only, Cloud Run ignores this)
 EXPOSE 8080
 
-# Health check (Cloud Run uses HTTP probes)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+# Health check (Cloud Run uses HTTP probes, but this helps during build)
+# Increased start-period to allow for initialization time
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8080/health', timeout=5.0)" || exit 1
 
 # Run the application
+# Ensure we listen on 0.0.0.0 (all interfaces) for Cloud Run
 CMD ["sh", "-c", "python __main__.py --host 0.0.0.0 --port ${PORT:-8080}"]
