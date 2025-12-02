@@ -20,7 +20,7 @@ from a2a.types import (
     AgentSkill,
 )
 
-from select_freelancer_agent import SelectFreelancerAgent
+from select_freelancer_agent import SelectFreelancerReActAgent
 from agent_executor import SelectFreelancerAgentExecutor
 
 load_dotenv(override=True)
@@ -64,8 +64,8 @@ def main(host, port):
             description='An agent that manages project phases and roles, and selects freelancers based on requirements.',
             url=public_url,
             version='1.0.0',
-            default_input_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
-            default_output_modes=SelectFreelancerAgent.SUPPORTED_CONTENT_TYPES,
+            default_input_modes=SelectFreelancerReActAgent.SUPPORTED_CONTENT_TYPES,
+            default_output_modes=SelectFreelancerReActAgent.SUPPORTED_CONTENT_TYPES,
             capabilities=capabilities,
             skills=[select_freelancer_skill],
         )
