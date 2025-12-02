@@ -98,14 +98,12 @@ class FlashBrainReActAgent:
         self.supabase_url = supabase_url or os.getenv("SUPABASE_URL")
         self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         # Use SUPABASE_POOLER for checkpointer connection
-        self.postgres_connection = postgres_connection or os.getenv("SUPABASE_TRANSACTION_POOLER")
+        self.postgres_connection = postgres_connection or os.getenv("SUPABASE_POOLER")
         self.supabase_client = None
         self.remote_agent_connections = {} # {card name: RemoteAgentConneciton}
         self.cards = {} # {card name: AgentCard}
         self.agents = None
         self.tools = []
-        self.checkpointer = None  # Store checkpointer to keep it alive
-        self.checkpointer_cm = None  # Store context manager for cleanup
         
         # Initialize Supabase client for conversation persistence
         if self.supabase_url and self.supabase_key:
@@ -332,43 +330,13 @@ class FlashBrainReActAgent:
                 "FlashBrain cannot run without persistent state storage."
             )
 
-        # Create async checkpointer - from_conn_string returns an async context manager
-        # We need to enter it to get the actual checkpointer instance
-        self.checkpointer_cm = AsyncPostgresSaver.from_conn_string(self.postgres_connection)
-        self.checkpointer = await self.checkpointer_cm.__aenter__()
-        
-        # Setup checkpointer - handle the case where prepared statements already exist
-        # This happens because setup() creates prepared statements and isn't fully idempotent
-        # The error occurs when setup() is called multiple times, even in the same process
-        try:
-            await self.checkpointer.setup()
-            logger.info("Checkpointer setup completed successfully")
-        except Exception as e:
-            # Catch "prepared statement already exists" errors - this means setup was already done
-            error_msg = str(e).lower()
-            if "prepared statement" in error_msg and "already exists" in error_msg:
-                # Setup was already done (probably by a previous initialization attempt)
-                # This is safe to ignore - the tables and statements already exist
-                logger.info(f"Checkpointer already initialized (prepared statements exist): {error_msg[:100]}")
-            elif "already exists" in error_msg:
-                # Other "already exists" errors (like tables) are also safe to ignore
-                logger.info(f"Checkpointer already initialized: {error_msg[:100]}")
-            else:
-                # Re-raise if it's a different error (connection issues, etc.)
-                logger.error(f"Checkpointer setup failed with unexpected error: {e}")
-                raise
-        
-        # Create the ReAct agent - this is the magic!
-        # LangGraph handles all the complexity of tool calling, retries, and state management
-        # Note: System prompt is injected via messages in the stream() method
-        agent = create_agent(
-            self.llm,
-            tools=self.tools,
-            checkpointer=self.checkpointer
-        )
-        
-        logger.info("ReAct agent created successfully")
-        return agent
+        # DON'T create the graph here - it will be created fresh per request in stream()
+        # This ensures proper connection lifecycle and avoids stale connections
+        # create_agent() returns a CompiledStateGraph, so we can't compile it again
+        # Instead, we'll call create_agent() fresh in stream() with a fresh checkpointer
+
+        logger.info("ReAct agent builder ready (graph will be created per-request with fresh checkpointer)")
+        return None  # No pre-compiled graph
     
     async def ensure_conversation_exists(self, conversation_id: str, user_id: str = None):
         """
@@ -479,124 +447,129 @@ class FlashBrainReActAgent:
             final_response = ""
             seen_content = set()  # Track already-yielded content to avoid duplicates
 
-            # Log pool stats before streaming
-            if hasattr(self, 'pool'):
-                logger.info(f"Connection pool stats: size={self.pool._nconns}, available={self.pool._pool.qsize()}, max={self.pool.max_size}")
+            # Create fresh checkpointer for THIS request only
+            # This ensures proper connection lifecycle and avoids stale/closed connections
+            async with AsyncPostgresSaver.from_conn_string(self.postgres_connection) as checkpointer:
+                await checkpointer.setup()
 
-            # Stream from the ReAct agent
-            async for event in self.graph.astream(
-                {"messages": messages},
-                config=config,
-                stream_mode="messages"
-            ):
-                # Handle different event types
-                if isinstance(event, tuple):
-                    message, _ = event
-
-                    # Stream AI message content
-                    if isinstance(message, AIMessage) and message.content:
-                        # Skip tool call messages (they have tool_calls attribute)
-                        if not message.tool_calls:
-                            # Handle both string and list content
-                            content = message.content
-                            if isinstance(content, list):
-                                # Convert list to string
-                                content = '\n'.join([str(item) for item in content])
-
-                            # Skip if we've already seen this exact content
-                            if content in seen_content:
-                                continue
-
-                            seen_content.add(content)
-
-                            # Check if human input is required by detecting JSON signal
-                            requires_input = False
-                            human_request = None
-
-                            try:
-                                # Try to parse as JSON (in case the content is the tool output)
-                                data = json.loads(content)
-                                if data.get("type") == "HUMAN_INPUT_REQUIRED":
-                                    requires_input = True
-                                    human_request = data
-                            except (json.JSONDecodeError, TypeError):
-                                # Not JSON, check for plain text signal
-                                if '"type": "HUMAN_INPUT_REQUIRED"' in content or '"type":"HUMAN_INPUT_REQUIRED"' in content:
-                                    requires_input = True
-                                    # Try to extract from the text
-                                    try:
-                                        start_idx = content.find('{')
-                                        end_idx = content.rfind('}') + 1
-                                        if start_idx >= 0 and end_idx > start_idx:
-                                            human_request = json.loads(content[start_idx:end_idx])
-                                    except:
-                                        pass
-
-                            if requires_input and human_request:
-                                # Extract question from the structured payload
-                                question = human_request.get("question", "Please provide more information")
-                                context_info = human_request.get("context", "")
-
-                                response_content = question
-                                if context_info:
-                                    response_content += f"\n\nContext: {context_info}"
-
-                                yield {
-                                    'is_task_complete': False,
-                                    'require_user_input': True,
-                                    'content': response_content
-                                }
-                                # Stop streaming - wait for user response
-                                logger.info(f"Human input requested: {question}")
-                                # Save the response before stopping
-                                await self.save_message(
-                                    conversation_id=context_id,
-                                    role="ai",
-                                    content=response_content,
-                                    metadata={"client_id": client_id, "project_id": project_id}
-                                )
-                                yield {
-                                    'is_task_complete': True,
-                                    'require_user_input': True,
-                                    'content': ''
-                                }
-                                return
-                            else:
-                                # Normal message
-                                final_response = content
-                                yield {
-                                    'is_task_complete': False,
-                                    'require_user_input': False,
-                                    'content': content
-                                }
-
-            # Save final AI response
-            if final_response:
-                await self.save_message(
-                    conversation_id=context_id,
-                    role="ai",
-                    content=final_response,
-                    metadata={"client_id": client_id, "project_id": project_id}
+                # Create the ReAct agent WITH fresh checkpointer
+                # This returns a CompiledStateGraph ready to use
+                graph = create_agent(
+                    self.llm,
+                    tools=self.tools,
+                    checkpointer=checkpointer
                 )
-                yield {
-                    'is_task_complete': True,
-                    'require_user_input': False,
-                    'content': ''  # Don't repeat content, just signal completion
-                }
-            else:
-                yield {
-                    'is_task_complete': True,
-                    'require_user_input': False,
-                    'content': ''
-                }
 
-        except GeneratorExit:
-            logger.warning(f"Stream cancelled by client for thread {context_id}")
-            # Checkpointer context manager should handle cleanup
-            raise
+                # Stream from the ReAct agent with fresh checkpointer
+                async for event in graph.astream(
+                    {"messages": messages},
+                    config=config,
+                    stream_mode="messages"
+                ):
+                    # Handle different event types
+                    if isinstance(event, tuple):
+                        message, _ = event
+
+                        # Stream AI message content
+                        if isinstance(message, AIMessage) and message.content:
+                            # Skip tool call messages (they have tool_calls attribute)
+                            if not message.tool_calls:
+                                # Handle both string and list content
+                                content = message.content
+                                if isinstance(content, list):
+                                    # Convert list to string
+                                    content = '\n'.join([str(item) for item in content])
+
+                                # Skip if we've already seen this exact content
+                                if content in seen_content:
+                                    continue
+
+                                seen_content.add(content)
+
+                                # Check if human input is required by detecting JSON signal
+                                requires_input = False
+                                human_request = None
+
+                                try:
+                                    # Try to parse as JSON (in case the content is the tool output)
+                                    data = json.loads(content)
+                                    if data.get("type") == "HUMAN_INPUT_REQUIRED":
+                                        requires_input = True
+                                        human_request = data
+                                except (json.JSONDecodeError, TypeError):
+                                    # Not JSON, check for plain text signal
+                                    if '"type": "HUMAN_INPUT_REQUIRED"' in content or '"type":"HUMAN_INPUT_REQUIRED"' in content:
+                                        requires_input = True
+                                        # Try to extract from the text
+                                        try:
+                                            start_idx = content.find('{')
+                                            end_idx = content.rfind('}') + 1
+                                            if start_idx >= 0 and end_idx > start_idx:
+                                                human_request = json.loads(content[start_idx:end_idx])
+                                        except:
+                                            pass
+
+                                if requires_input and human_request:
+                                    # Extract question from the structured payload
+                                    question = human_request.get("question", "Please provide more information")
+                                    context_info = human_request.get("context", "")
+
+                                    response_content = question
+                                    if context_info:
+                                        response_content += f"\n\nContext: {context_info}"
+
+                                    yield {
+                                        'is_task_complete': False,
+                                        'require_user_input': True,
+                                        'content': response_content
+                                    }
+                                    # Stop streaming - wait for user response
+                                    logger.info(f"Human input requested: {question}")
+                                    # Save the response before stopping
+                                    await self.save_message(
+                                        conversation_id=context_id,
+                                        role="ai",
+                                        content=response_content,
+                                        metadata={"client_id": client_id, "project_id": project_id}
+                                    )
+                                    yield {
+                                        'is_task_complete': True,
+                                        'require_user_input': True,
+                                        'content': ''
+                                    }
+                                    return
+                                else:
+                                    # Normal message
+                                    final_response = content
+                                    yield {
+                                        'is_task_complete': False,
+                                        'require_user_input': False,
+                                        'content': content
+                                    }
+
+                # Save final AI response (after streaming completes)
+                if final_response:
+                    await self.save_message(
+                        conversation_id=context_id,
+                        role="ai",
+                        content=final_response,
+                        metadata={"client_id": client_id, "project_id": project_id}
+                    )
+                    yield {
+                        'is_task_complete': True,
+                        'require_user_input': False,
+                        'content': ''  # Don't repeat content, just signal completion
+                    }
+                else:
+                    yield {
+                        'is_task_complete': True,
+                        'require_user_input': False,
+                        'content': ''
+                    }
+
         except GeneratorExit:
             logger.warning(f"Stream cancelled by client for thread {context_id}. Cleaning up.")
-            # Ensure the generator is closed properly
+            # Checkpointer context manager should handle cleanup
             raise
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
