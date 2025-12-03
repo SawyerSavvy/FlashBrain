@@ -11,7 +11,8 @@ Architecture:
                         +-- Tool: find_freelancers (A2A -> Select Freelancer Agent)
                         +-- Tool: get_project_data (Supabase read)
                         +-- Tool: calculate_budget (FinOps)
-                        +-- Tool: search_knowledge_base (future MCP)
+                        +-- Tool: process_document (MCP -> RAG Service)
+                        +-- Tool: search_knowledge_base (MCP -> RAG Service)
 
 Benefits over custom graph:
     - 1 LLM call instead of 3+ (faster, cheaper)
@@ -104,6 +105,7 @@ class FlashBrainReActAgent:
         self.cards = {} # {card name: AgentCard}
         self.agents = None
         self.tools = []
+        self.rag_service_url = os.getenv("RAG_SERVICE_URL", "http://localhost:8014")
         
         # Initialize Supabase client for conversation persistence
         if self.supabase_url and self.supabase_key:
@@ -172,37 +174,6 @@ class FlashBrainReActAgent:
             except Exception as e:
                 logger.error(f"Failed to close pool: {e}")
       
-    def _create_request_human_input_tool(self):
-        """
-        Creates a tool that allows the agent to request input from the user.
-        Returns a structured JSON signal that the orchestrator can detect.
-        
-        Returns:
-            A LangChain tool function
-        """
-        @tool
-        def request_human_input(question: str, context: Optional[str] = None) -> str:
-            """
-            Request input or clarification from the human user.
-            Use this when you need more information to complete a task.
-            
-            Args:
-                question: The question to ask the user
-                context: Optional context about why you need this information
-            
-            Returns:
-                JSON signal that input is required
-            """
-            # Return structured JSON that the orchestrator can detect
-            payload = {
-                "type": "HUMAN_INPUT_REQUIRED",
-                "question": question,
-                "context": context or ""
-            }
-            return json.dumps(payload)
-        
-        return request_human_input
-    
     def _create_send_message_tool(self):
         """
         Creates the send_message tool with access to self.remote_agent_connections.
@@ -279,6 +250,180 @@ class FlashBrainReActAgent:
         
         return send_message
     
+    def _create_process_document_tool(self):
+        """
+        Creates a tool for processing documents via MCP RAG service.
+        
+        Returns:
+            A LangChain tool function
+        """
+        agent_instance = self
+        
+        @tool
+        async def process_document(
+            file_path: Optional[str] = None,
+            file_url: Optional[str] = None,
+            content: Optional[str] = None,
+            supabase_bucket_name: Optional[str] = None,
+            supabase_bucket_path: Optional[str] = None,
+            source_type: str = "pdf",
+            title: Optional[str] = None,
+            project_id: Optional[str] = None,
+            client_id: Optional[str] = None
+        ) -> str:
+            """
+            Process a document with intelligent decomposition into semantic chunks.
+            The document will be stored in the knowledge base for future searches.
+            
+            Priority order:
+            1. content (direct text)
+            2. supabase_bucket_name + supabase_bucket_path (RECOMMENDED for production - no API timeouts, files persist)
+            3. file_path (local file)
+            4. file_url (external URL)
+            
+            Args:
+                file_path: Path to local file (e.g., "/path/to/document.pdf")
+                file_url: URL to fetch file from (e.g., "https://example.com/doc.pdf")
+                content: Direct text content (if source_type is 'text')
+                supabase_bucket_name: Supabase Storage bucket name (e.g., "documents") - RECOMMENDED
+                supabase_bucket_path: Path to file in Supabase Storage (e.g., "project-123/doc.pdf")
+                source_type: Type of document ('pdf', 'text', 'url', 'file')
+                title: Optional document title
+                project_id: Optional project ID for context
+                client_id: Optional client ID for context
+            
+            Returns:
+                JSON string with document_id and chunk_count
+            """
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    request_data = {
+                        "source_type": source_type
+                    }
+                    if file_path:
+                        request_data["file_path"] = file_path
+                    if file_url:
+                        request_data["file_url"] = file_url
+                    if content:
+                        request_data["content"] = content
+                    if supabase_bucket_name:
+                        request_data["supabase_bucket_name"] = supabase_bucket_name
+                    if supabase_bucket_path:
+                        request_data["supabase_bucket_path"] = supabase_bucket_path
+                    if title:
+                        request_data["title"] = title
+                    if project_id:
+                        request_data["project_id"] = project_id
+                    if client_id:
+                        request_data["client_id"] = client_id
+                    
+                    response = await client.post(
+                        f"{agent_instance.rag_service_url}/mcp/tools/process_document",
+                        json=request_data
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    
+                    return json.dumps({
+                        "status": "success",
+                        "document_id": result["document_id"],
+                        "chunk_count": result["chunk_count"],
+                        "title": result["title"],
+                        "source": result["source"]
+                    })
+            except httpx.HTTPError as e:
+                error_msg = f"Failed to process document: {str(e)}"
+                logger.error(error_msg)
+                return json.dumps({"status": "error", "message": error_msg})
+            except Exception as e:
+                error_msg = f"Unexpected error processing document: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return json.dumps({"status": "error", "message": error_msg})
+        
+        return process_document
+    
+    def _create_search_knowledge_base_tool(self):
+        """
+        Creates a tool for semantic search via MCP RAG service.
+        
+        Returns:
+            A LangChain tool function
+        """
+        agent_instance = self
+        
+        @tool
+        async def search_knowledge_base(
+            query: str,
+            match_threshold: float = 0.7,
+            match_count: int = 10,
+            document_id: Optional[str] = None,
+            project_id: Optional[str] = None,
+            client_id: Optional[str] = None
+        ) -> str:
+            """
+            Search the knowledge base for semantically similar document chunks.
+            Use this to find relevant information from previously processed documents.
+            
+            Args:
+                query: Search query text
+                match_threshold: Minimum similarity threshold (0-1, default 0.7)
+                match_count: Maximum number of results (default 10)
+                document_id: Optional filter by specific document ID
+                project_id: Optional filter by project ID
+                client_id: Optional filter by client ID
+            
+            Returns:
+                JSON string with search results including content and similarity scores
+            """
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    request_data = {
+                        "query": query,
+                        "match_threshold": match_threshold,
+                        "match_count": match_count
+                    }
+                    if document_id:
+                        request_data["document_id"] = document_id
+                    if project_id:
+                        request_data["project_id"] = project_id
+                    if client_id:
+                        request_data["client_id"] = client_id
+                    
+                    response = await client.post(
+                        f"{agent_instance.rag_service_url}/mcp/tools/search_knowledge_base",
+                        json=request_data
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    
+                    # Format results for readability
+                    formatted_results = []
+                    for r in result["results"]:
+                        formatted_results.append({
+                            "content": r["content"],
+                            "similarity": round(r["similarity"], 3),
+                            "document_id": r["document_id"],
+                            "chunk_index": r["chunk_index"],
+                            "metadata": r.get("metadata", {})
+                        })
+                    
+                    return json.dumps({
+                        "status": "success",
+                        "query": result["query"],
+                        "total_results": result["total_results"],
+                        "results": formatted_results
+                    }, indent=2)
+            except httpx.HTTPError as e:
+                error_msg = f"Failed to search knowledge base: {str(e)}"
+                logger.error(error_msg)
+                return json.dumps({"status": "error", "message": error_msg})
+            except Exception as e:
+                error_msg = f"Unexpected error searching knowledge base: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return json.dumps({"status": "error", "message": error_msg})
+        
+        return search_knowledge_base
+    
     async def _build_graph(self):
         """
         Builds the ReAct agent graph with PostgreSQL checkpointer.
@@ -319,9 +464,10 @@ class FlashBrainReActAgent:
         # Define tools now that we have agent connections
         self.tools = [
             self._create_send_message_tool(),  # Generic tool for calling any agent
-            self._create_request_human_input_tool(),  # Request user input
+            self._create_process_document_tool(),  # MCP: Process documents
+            self._create_search_knowledge_base_tool(),  # MCP: Semantic search
         ]
-        logger.info(f"Created {len(self.tools)} tools ({len(self.remote_agent_connections)} remote agents)")
+        logger.info(f"Created {len(self.tools)} tools ({len(self.remote_agent_connections)} remote agents, 2 MCP RAG tools)")
         
         # Initialize PostgreSQL checkpointer for state persistence
         if not self.postgres_connection:
@@ -476,9 +622,34 @@ class FlashBrainReActAgent:
                             if not message.tool_calls:
                                 # Handle both string and list content
                                 content = message.content
+
+                                # Parse Gemini's response format
                                 if isinstance(content, list):
-                                    # Convert list to string
-                                    content = '\n'.join([str(item) for item in content])
+                                    # Handle list of content items (Gemini format)
+                                    text_parts = []
+                                    for item in content:
+                                        if isinstance(item, dict):
+                                            # Extract text from dict format: {'type': 'text', 'text': '...', 'extras': {...}}
+                                            if item.get('type') == 'text' and 'text' in item:
+                                                text_parts.append(item['text'])
+                                            elif 'text' in item:
+                                                text_parts.append(item['text'])
+                                            else:
+                                                # Fallback for other dict formats
+                                                text_parts.append(str(item))
+                                        elif isinstance(item, str):
+                                            text_parts.append(item)
+                                        else:
+                                            text_parts.append(str(item))
+                                    content = '\n'.join(text_parts)
+                                elif isinstance(content, dict):
+                                    # Handle single dict format: {'type': 'text', 'text': '...', 'extras': {...}}
+                                    if content.get('type') == 'text' and 'text' in content:
+                                        content = content['text']
+                                    elif 'text' in content:
+                                        content = content['text']
+                                    else:
+                                        content = str(content)
 
                                 # Skip if we've already seen this exact content
                                 if content in seen_content:
@@ -486,66 +657,13 @@ class FlashBrainReActAgent:
 
                                 seen_content.add(content)
 
-                                # Check if human input is required by detecting JSON signal
-                                requires_input = False
-                                human_request = None
-
-                                try:
-                                    # Try to parse as JSON (in case the content is the tool output)
-                                    data = json.loads(content)
-                                    if data.get("type") == "HUMAN_INPUT_REQUIRED":
-                                        requires_input = True
-                                        human_request = data
-                                except (json.JSONDecodeError, TypeError):
-                                    # Not JSON, check for plain text signal
-                                    if '"type": "HUMAN_INPUT_REQUIRED"' in content or '"type":"HUMAN_INPUT_REQUIRED"' in content:
-                                        requires_input = True
-                                        # Try to extract from the text
-                                        try:
-                                            start_idx = content.find('{')
-                                            end_idx = content.rfind('}') + 1
-                                            if start_idx >= 0 and end_idx > start_idx:
-                                                human_request = json.loads(content[start_idx:end_idx])
-                                        except:
-                                            pass
-
-                                if requires_input and human_request:
-                                    # Extract question from the structured payload
-                                    question = human_request.get("question", "Please provide more information")
-                                    context_info = human_request.get("context", "")
-
-                                    response_content = question
-                                    if context_info:
-                                        response_content += f"\n\nContext: {context_info}"
-
-                                    yield {
-                                        'is_task_complete': False,
-                                        'require_user_input': True,
-                                        'content': response_content
-                                    }
-                                    # Stop streaming - wait for user response
-                                    logger.info(f"Human input requested: {question}")
-                                    # Save the response before stopping
-                                    await self.save_message(
-                                        conversation_id=context_id,
-                                        role="ai",
-                                        content=response_content,
-                                        metadata={"client_id": client_id, "project_id": project_id}
-                                    )
-                                    yield {
-                                        'is_task_complete': True,
-                                        'require_user_input': True,
-                                        'content': ''
-                                    }
-                                    return
-                                else:
-                                    # Normal message
-                                    final_response = content
-                                    yield {
-                                        'is_task_complete': False,
-                                        'require_user_input': False,
-                                        'content': content
-                                    }
+                                # Normal message - just stream it
+                                final_response = content
+                                yield {
+                                    'is_task_complete': False,
+                                    'require_user_input': False,
+                                    'content': content
+                                }
 
                 # Save final AI response (after streaming completes)
                 if final_response:
