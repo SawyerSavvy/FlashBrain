@@ -544,16 +544,18 @@ class FlashBrainReActAgent:
         query: str,
         context_id: str = "default",
         client_id: str = None,
-        project_id: str = None
+        project_id: str = None,
+        ai_persona: str = None
     ):
         """
         Streams responses from the FlashBrain ReAct Agent.
-        
+
         Args:
             query: User's message/query
             context_id: Conversation thread ID
             client_id: Client ID for authentication
             project_id: Current project ID context
+            ai_persona: Optional AI persona/personality instructions to modify behavior
 
         Yields:
             Dict with streaming response data:
@@ -576,8 +578,14 @@ class FlashBrainReActAgent:
             )
             
             # Build message list with system prompt and context
-            messages = [SystemMessage(content=f"{FLASHBRAIN_SYSTEM_PROMPT}\n\nAvailable agents: {self.agents}")]
-            
+            base_prompt = f"{FLASHBRAIN_SYSTEM_PROMPT}\n\nAvailable agents: {self.agents}"
+
+            # Add AI persona if provided
+            if ai_persona:
+                base_prompt += f"\n\n## AI Persona\n{ai_persona}\n\nImportant: Adopt this persona in your responses while maintaining your core capabilities and helpfulness."
+
+            messages = [SystemMessage(content=base_prompt)]
+
             # Add context information if provided
             if project_id or client_id:
                 context_info = []

@@ -303,6 +303,14 @@ paths:
         **Use A2A endpoints when:**
         - Building agent-to-agent communication
         - You need full A2A protocol features (task management, artifacts, etc.)
+
+        **Response Format:**
+        Each SSE event contains a JSON object with:
+        - `is_task_complete`: boolean - Whether the task is complete
+        - `require_user_input`: boolean - Whether user input is required
+        - `content`: string - Response content (empty string in final completion event)
+
+        On error, a final event is sent with `is_task_complete: true` and `content` containing the error message.
       operationId: chatStream
       requestBody:
         required: true
@@ -313,16 +321,18 @@ paths:
             example:
               message: "Help me plan a project for an e-commerce website"
               conversation_id: "user_123_session_456"
-              client_id: "client_abc"
-              project_id: "proj_xyz"
+              metadata:
+                client_id: "client_abc"
+                project_id: "proj_xyz"
+                ai_persona: "You are a friendly and enthusiastic project manager"
       responses:
         '200':
-          description: Stream of chat events
+          description: Stream of chat events (Server-Sent Events)
           content:
             text/event-stream:
               schema:
                 type: string
-                description: Server-Sent Events stream with JSON payloads
+                description: Server-Sent Events stream with JSON payloads matching ChatStreamEvent schema
               example: |
                 data: {"is_task_complete": false, "require_user_input": false, "content": "I'll help you plan your e-commerce project. Let me gather some information..."}
 
@@ -330,9 +340,21 @@ paths:
 
                 data: {"is_task_complete": true, "require_user_input": false, "content": ""}
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Bad request - invalid input parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Invalid request body"
         '500':
-          $ref: '#/components/responses/InternalError'
+          description: Internal server error (may also be sent as final SSE event)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Internal server error"
 
   /callbacks/project-complete:
     post:
@@ -342,6 +364,9 @@ paths:
       description: |
         Webhook endpoint called by sub-agents (e.g., Project Decomposition Agent)
         when a long-running async job completes.
+
+        This endpoint updates the job status in the database and acknowledges receipt.
+        Called internally by sub-agents, not intended for direct client use.
       operationId: handleProjectComplete
       requestBody:
         required: true
@@ -359,28 +384,57 @@ paths:
                 estimated_cost: 50000
       responses:
         '200':
-          description: Callback acknowledged
+          description: Callback acknowledged and processed
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - status
+                  - job_id
+                  - message
                 properties:
                   status:
                     type: string
                     example: acknowledged
+                    description: Acknowledgment status
                   job_id:
                     type: string
+                    description: The job ID that was processed
+                    example: job_xyz789
                   message:
                     type: string
+                    description: Confirmation message
+                    example: Callback received and processed
+              example:
+                status: acknowledged
+                job_id: job_xyz789
+                message: Callback received and processed
+        '400':
+          description: Bad request - invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Invalid payload format"
         '500':
-          $ref: '#/components/responses/InternalError'
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Failed to process callback"
 
   /health:
     get:
       tags:
         - Agent Card
       summary: Health Check
-      description: Check if the service is healthy and responding
+      description: |
+        Health check endpoint for Cloud Run and monitoring.
+        Returns the service health status.
       operationId: healthCheck
       responses:
         '200':
@@ -393,9 +447,12 @@ paths:
                   status:
                     type: string
                     example: healthy
-                  version:
+                  service:
                     type: string
-                    example: "2.0.0"
+                    example: FlashBrain Orchestrator
+              example:
+                status: healthy
+                service: FlashBrain Orchestrator
 
 components:
   schemas:
@@ -797,14 +854,27 @@ components:
           description: Conversation/session identifier for multi-turn conversations
           default: "default"
           example: "user_123_session_456"
-        client_id:
-          type: string
-          description: Client identifier for authorization and context
-          example: "client_abc123"
-        project_id:
-          type: string
-          description: Project context identifier
-          example: "proj_xyz789"
+        metadata:
+          type: object
+          description: Optional metadata containing client_id, project_id, ai_persona, and other context
+          additionalProperties: true
+          properties:
+            client_id:
+              type: string
+              description: Client identifier for authorization and context
+              example: "client_abc123"
+            project_id:
+              type: string
+              description: Project context identifier
+              example: "proj_xyz789"
+            ai_persona:
+              type: string
+              description: Optional AI persona/personality instructions to modify the assistant's behavior and tone. Use this to customize how the AI responds (e.g., "You are a friendly mentor who uses simple language" or "You are a formal business consultant")
+              example: "You are a friendly and enthusiastic project manager who loves to motivate teams"
+          example:
+            client_id: "client_abc123"
+            project_id: "proj_xyz789"
+            ai_persona: "You are a friendly mentor who uses simple language"
 
     ChatStreamEvent:
       type: object
@@ -964,8 +1034,11 @@ x-documentation:
               payload = {
                   "message": "Help me plan a project",
                   "conversation_id": str(uuid4()),
-                  "client_id": "user_123",
-                  "project_id": "proj_456"
+                  "metadata": {
+                      "client_id": "user_123",
+                      "project_id": "proj_456",
+                      "ai_persona": "You are a friendly mentor who uses simple language"
+                  }
               }
 
               async with client.stream("POST", url, json=payload) as response:
@@ -992,8 +1065,11 @@ x-documentation:
         -d '{
           "message": "Help me plan a project",
           "conversation_id": "session_123",
-          "client_id": "user_abc",
-          "project_id": "proj_xyz"
+          "metadata": {
+            "client_id": "user_abc",
+            "project_id": "proj_xyz",
+            "ai_persona": "You are a friendly mentor who uses simple language"
+          }
         }'
 
       # Response (Server-Sent Events):

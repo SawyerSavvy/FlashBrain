@@ -28,7 +28,7 @@ from a2a.types import (
 )
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 from langchain_core.messages import HumanMessage, AIMessage
 
 from FlashBrain import FlashBrainReActAgent
@@ -111,8 +111,7 @@ def main(host, port):
             """Request payload for chat streaming endpoint."""
             message: str
             conversation_id: str = "default"
-            client_id: Optional[str] = None
-            project_id: Optional[str] = None
+            metadata: Optional[Dict[str, Any]] = None
 
         server = A2AStarletteApplication(
             agent_card=agent_card,
@@ -133,7 +132,13 @@ def main(host, port):
                 body = await request.json()
                 chat_request = ChatStreamRequest(**body)
 
-                logger.info(f"Chat stream request: conversation_id={chat_request.conversation_id}, client_id={chat_request.client_id}")
+                # Extract values from metadata (with backward compatibility)
+                metadata = chat_request.metadata or {}
+                client_id = metadata.get('client_id')
+                project_id = metadata.get('project_id')
+                ai_persona = metadata.get('ai_persona')
+
+                logger.info(f"Chat stream request: conversation_id={chat_request.conversation_id}, client_id={client_id}, metadata={metadata}")
 
                 # Stream generator
                 async def event_generator():
@@ -141,8 +146,9 @@ def main(host, port):
                         async for event in flashbrain_agent.stream(
                             query=chat_request.message,
                             context_id=chat_request.conversation_id,
-                            client_id=chat_request.client_id,
-                            project_id=chat_request.project_id
+                            client_id=client_id,
+                            project_id=project_id,
+                            ai_persona=ai_persona
                         ):
                             # Send as Server-Sent Events format
                             yield f"data: {json.dumps(event)}\n\n"
