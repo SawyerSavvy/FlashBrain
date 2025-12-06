@@ -1,0 +1,47 @@
+# Cloud Build pipeline for the RAG Service (Cloud Run)
+# Usage:
+#   gcloud builds submit --config cloudbuild-rag.yaml --substitutions=_REGION=us-central1,_SERVICE_NAME=rag-service
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE_NAME: rag-service
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-rag-service'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+      - '-f'
+      - 'Agents/RAG Service/Dockerfile'
+      - 'Agents/RAG Service'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-rag-service'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}']
+    waitFor: ['build-rag-service']
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-rag-service'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image=gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--min-instances=0'
+      - '--max-instances=5'
+      - '--memory=1Gi'
+      - '--cpu=1'
+      - '--cpu-boost'
+      - '--timeout=300'
+      - '--port=8080'
+
+images:
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
