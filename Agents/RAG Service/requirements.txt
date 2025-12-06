@@ -26,3 +26,5 @@ beautifulsoup4>=4.12.0  # HTML parsing for hybrid chunking
 numpy>=1.24.0  # For vector operations
 scikit-learn>=1.3.0  # Optimized cosine similarity for semantic chunking
 
+# Google Gemini client
+google-genai>=0.3.0
