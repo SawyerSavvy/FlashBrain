@@ -1,0 +1,481 @@
+openapi: 3.0.3
+info:
+  title: GitHub Onboarding Agent API
+  description: |
+    API for analyzing GitHub developer profiles and verifying freelancer skills.
+
+    ## Two-Way Communication
+
+    This service supports two communication modes:
+
+    ### 1. REST API (Request/Response)
+    Standard HTTP endpoints for simple integrations. Use these for:
+    - One-off analysis requests
+    - Skill verification
+    - Health checks
+
+    ### 2. A2A Protocol (Bidirectional Streaming)
+    Agent-to-Agent protocol for real-time streaming responses. Use this for:
+    - Long-running analysis with progress updates
+    - Interactive conversations
+    - Integration with other A2A-compatible agents
+
+    See the A2A endpoints section for streaming capabilities.
+
+  version: 1.0.0
+  contact:
+    name: FlashBrain Team
+
+servers:
+  - url: http://localhost:8013
+    description: Local development
+  - url: https://onboarding-agent.your-domain.com
+    description: Production (Cloud Run)
+
+tags:
+  - name: REST API
+    description: Standard request/response endpoints
+  - name: A2A Protocol
+    description: Agent-to-Agent bidirectional streaming protocol
+  - name: Health
+    description: Service health and status
+
+paths:
+  # ===========================================
+  # REST API Endpoints
+  # ===========================================
+
+  /analyze:
+    post:
+      tags:
+        - REST API
+      summary: Analyze a GitHub developer profile
+      description: |
+        Performs full pipeline analysis on a GitHub user:
+        1. Extracts profile, repositories, and commits
+        2. Analyzes commit patterns
+        3. Calculates domain expertise
+        4. Calculates impact score
+        5. Generates developer story
+
+        **Note:** This is a synchronous endpoint. For long-running analysis
+        with streaming updates, use the A2A protocol instead.
+      operationId: analyzeGitHubUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalyzeRequest'
+            example:
+              github_username: "octocat"
+              client_id: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        '200':
+          description: Analysis completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyzeResponse'
+        '400':
+          description: Bad request - missing github_username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /verify-skills:
+    post:
+      tags:
+        - REST API
+      summary: Verify freelancer skills against GitHub evidence
+      description: |
+        Validates self-reported skills by checking:
+        - RAG search for skill mentions in README files
+        - File extensions in commits matching skill patterns
+
+        Updates `freelancer_skills.evidence_strength` to:
+        - `github_verified` (confidence >= 0.7)
+        - `github_partial` (confidence 0.4-0.7)
+        - `self_reported` (confidence < 0.4)
+      operationId: verifySkills
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifySkillsRequest'
+            example:
+              freelancer_id: "550e8400-e29b-41d4-a716-446655440000"
+              max_skills: 20
+      responses:
+        '200':
+          description: Skills verification completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifySkillsResponse'
+        '400':
+          description: Bad request - missing freelancer_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check endpoint
+      description: Returns service health status for load balancers and monitoring.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # ===========================================
+  # A2A Protocol Endpoints (Two-Way Streaming)
+  # ===========================================
+
+  /.well-known/agent.json:
+    get:
+      tags:
+        - A2A Protocol
+      summary: Get agent card (A2A discovery)
+      description: |
+        Returns the A2A agent card describing this agent's capabilities,
+        skills, and supported content types. Used for agent discovery.
+      operationId: getAgentCard
+      responses:
+        '200':
+          description: Agent card
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCard'
+
+  /:
+    post:
+      tags:
+        - A2A Protocol
+      summary: Send message to agent (A2A streaming)
+      description: |
+        **Two-Way Streaming Protocol**
+
+        Send a message to the agent and receive streaming responses. This endpoint
+        supports the A2A (Agent-to-Agent) protocol for bidirectional communication.
+
+        **How it works:**
+        1. Client sends a message with task context
+        2. Server streams back events as the agent works:
+           - `working` events with tool call progress
+           - `artifact` events with results
+           - `completed` event when done
+        3. Client can send follow-up messages in the same context
+
+        **Streaming Response Format:**
+        ```
+        event: task_update
+        data: {"state": "working", "message": "Calling extract_github_data..."}
+
+        event: task_update
+        data: {"state": "working", "message": "Analyzing commit patterns..."}
+
+        event: artifact
+        data: {"name": "analysis", "parts": [{"text": "..."}]}
+
+        event: task_complete
+        data: {"state": "completed"}
+        ```
+
+        **Use Cases:**
+        - Real-time progress updates during long analysis
+        - Interactive multi-turn conversations
+        - Integration with other A2A agents
+      operationId: sendA2AMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/A2AMessageRequest'
+            example:
+              context_id: "conv-123"
+              message_id: "msg-456"
+              parts:
+                - text: "Analyze GitHub developer @octocat"
+              metadata:
+                github_username: "octocat"
+      responses:
+        '200':
+          description: Streaming response with task updates
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream
+            application/json:
+              schema:
+                $ref: '#/components/schemas/A2ATaskResponse'
+
+components:
+  schemas:
+    # ===========================================
+    # REST API Schemas
+    # ===========================================
+
+    AnalyzeRequest:
+      type: object
+      required:
+        - github_username
+      properties:
+        github_username:
+          type: string
+          description: GitHub username to analyze (without @)
+          example: "octocat"
+        client_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Optional client ID for multi-tenancy
+
+    AnalyzeResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        github_username:
+          type: string
+        message:
+          type: string
+        analysis:
+          type: string
+          description: Full analysis text from the agent
+        profile_id:
+          type: string
+          format: uuid
+          description: ID of the created/updated profile
+
+    VerifySkillsRequest:
+      type: object
+      required:
+        - freelancer_id
+      properties:
+        freelancer_id:
+          type: string
+          format: uuid
+          description: Freelancer UUID to verify skills for
+        skill_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Optional specific skill UUID to verify
+        max_skills:
+          type: integer
+          default: 20
+          description: Maximum number of skills to verify in one call
+
+    VerifySkillsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+        freelancer_id:
+          type: string
+          format: uuid
+        skills_verified:
+          type: integer
+          description: Total number of skills processed
+        github_verified:
+          type: integer
+          description: Skills with strong GitHub evidence (>= 0.7 confidence)
+        github_partial:
+          type: integer
+          description: Skills with partial evidence (0.4-0.7 confidence)
+        self_reported:
+          type: integer
+          description: Skills with no GitHub evidence (< 0.4 confidence)
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillVerificationResult'
+        message:
+          type: string
+
+    SkillVerificationResult:
+      type: object
+      properties:
+        skill_name:
+          type: string
+        skill_id:
+          type: string
+          format: uuid
+        previous_strength:
+          type: string
+          enum: [self_reported, endorsed, tested, verified, certified, demonstrated, github_verified, github_partial]
+        new_strength:
+          type: string
+          enum: [self_reported, github_partial, github_verified]
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        rag_mentions:
+          type: integer
+          description: Number of README mentions found
+        file_matches:
+          type: integer
+          description: Number of file extension matches
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "healthy"
+        service:
+          type: string
+          example: "github-onboarding-agent"
+        version:
+          type: string
+          example: "1.0.0"
+
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "error"
+        message:
+          type: string
+
+    # ===========================================
+    # A2A Protocol Schemas
+    # ===========================================
+
+    AgentCard:
+      type: object
+      description: A2A Agent Card for discovery
+      properties:
+        name:
+          type: string
+          example: "GitHub Onboarding Agent"
+        description:
+          type: string
+        url:
+          type: string
+          format: uri
+        version:
+          type: string
+        capabilities:
+          type: object
+          properties:
+            streaming:
+              type: boolean
+              example: true
+            push_notifications:
+              type: boolean
+              example: true
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentSkill'
+        default_input_modes:
+          type: array
+          items:
+            type: string
+          example: ["text"]
+        default_output_modes:
+          type: array
+          items:
+            type: string
+          example: ["text"]
+
+    AgentSkill:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        examples:
+          type: array
+          items:
+            type: string
+
+    A2AMessageRequest:
+      type: object
+      description: A2A protocol message
+      properties:
+        context_id:
+          type: string
+          description: Conversation/session ID for multi-turn
+        message_id:
+          type: string
+          description: Unique message identifier
+        parts:
+          type: array
+          items:
+            type: object
+            properties:
+              text:
+                type: string
+        metadata:
+          type: object
+          properties:
+            github_username:
+              type: string
+            profile_id:
+              type: string
+              format: uuid
+            client_id:
+              type: string
+              format: uuid
+
+    A2ATaskResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Task ID
+        context_id:
+          type: string
+        state:
+          type: string
+          enum: [submitted, working, completed, failed, canceled]
+        artifacts:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              parts:
+                type: array
+                items:
+                  type: object

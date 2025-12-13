@@ -1,0 +1,20 @@
+# A2A Protocol Dependencies
+a2a-sdk[http-server]>=0.3.16  # Official Google A2A SDK
+httpx>=0.24.0
+uvicorn>=0.23.0
+click>=8.1.0
+pydantic>=2.0.0
+
+# LangChain and LangGraph
+langgraph>=1.0.3
+langchain-core>=1.0.7
+langchain-google-genai>=3.1.0
+
+# Supabase
+supabase>=2.24.0
+
+# GitHub API
+# Uses httpx (already included above)
+
+# Other dependencies
+python-dotenv>=1.2.1

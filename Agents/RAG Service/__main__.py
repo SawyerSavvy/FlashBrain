@@ -118,9 +118,14 @@ async def mcp_process_document(request_data: Dict[str, Any]):
 async def mcp_search_knowledge_base(request_data: Dict[str, Any]):
     """
     MCP Tool: search_knowledge_base
-    
-    Perform semantic similarity search over stored document chunks.
-    
+
+    Perform semantic similarity search with BGE reranking. Uses a 2-stage pipeline:
+    1. Vector similarity search (fast recall) - retrieves top candidates
+    2. BGE reranker (precision ranking) - scores query-passage relevance
+
+    The BGE reranker (bge-reranker-v2-m3) is a specialized model trained specifically
+    for ranking tasks, providing more accurate relevance scores than cosine similarity alone.
+
     Request body:
     {
         "query": "search query text",
@@ -163,11 +168,11 @@ async def list_mcp_tools():
             },
             {
                 "name": "search_knowledge_base",
-                "description": "Perform semantic similarity search over stored document chunks",
+                "description": "Semantic search with BGE reranking. 2-stage pipeline: (1) Vector similarity retrieves candidates, (2) BGE reranker (bge-reranker-v2-m3) scores query-passage relevance for precision ranking. Returns most contextually relevant chunks.",
                 "parameters": {
                     "query": {"type": "string", "required": True, "description": "Search query"},
-                    "match_threshold": {"type": "float", "default": 0.7, "description": "Minimum similarity threshold (0-1)"},
-                    "match_count": {"type": "integer", "default": 10, "description": "Maximum number of results"},
+                    "match_threshold": {"type": "float", "default": 0.7, "description": "Minimum similarity threshold (0-1) for initial retrieval"},
+                    "match_count": {"type": "integer", "default": 10, "description": "Maximum number of results (after BGE reranking)"},
                     "document_id": {"type": "string", "optional": True, "description": "Filter by document ID"},
                     "client_id": {"type": "string", "optional": True},
                     "project_id": {"type": "string", "optional": True}

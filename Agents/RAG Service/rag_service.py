@@ -8,8 +8,6 @@ Provides two MCP tools:
 
 import os
 import logging
-import json
-import asyncio
 from typing import Dict, Any, Optional, List
 from uuid import UUID
 from pydantic import BaseModel, Field
@@ -18,6 +16,7 @@ from dotenv import load_dotenv
 from vector_store import VectorStore
 from document_processor import DocumentProcessor
 from genai_embeddings import GeminiEmbeddingClient
+from FlagEmbedding import FlagReranker
 
 load_dotenv()
 
@@ -80,7 +79,8 @@ class RAGService:
         self,
         supabase_url: Optional[str] = None,
         supabase_key: Optional[str] = None,
-        postgres_connection: Optional[str] = None
+        postgres_connection: Optional[str] = None,
+        reranker_model: Optional[str] = None
     ):
         """Initialize RAG service."""
         self.vector_store = VectorStore(
@@ -89,6 +89,19 @@ class RAGService:
             postgres_connection=postgres_connection
         )
         self.document_processor = DocumentProcessor()
+
+        # Initialize BGE reranker for relevance filtering
+        reranker_model = reranker_model or os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+        try:
+            self.reranker = FlagReranker(
+                reranker_model,
+                use_fp16=True  # Speed up inference with minimal performance loss
+            )
+            logger.info(f"Initialized BGE reranker: {reranker_model}")
+        except Exception as e:
+            logger.warning(f"Failed to load reranker: {e}. Reranking will be disabled.")
+            self.reranker = None
+
         logger.info("RAG Service initialized")
 
     async def process_document(self, request: ProcessDocumentRequest) -> ProcessDocumentResponse:
@@ -184,15 +197,34 @@ class RAGService:
                 except ValueError:
                     logger.warning(f"Invalid project_id format: {request.project_id}")
             
+            # Stage 1: Vector similarity search
+            # Fetch more candidates for reranking if reranker is available
+            initial_count = request.match_count * 3 if self.reranker else request.match_count
+
             results = await self.vector_store.similarity_search(
                 query_embedding=query_embedding,
                 match_threshold=request.match_threshold,
-                match_count=request.match_count,
+                match_count=initial_count,
                 document_id=document_uuid,
                 client_id=client_uuid,
                 project_id=project_uuid,
                 query_text=request.query
             )
+
+            logger.info(f"Stage 1 (Vector Similarity): Found {len(results)} candidates")
+
+            # Stage 2: BGE Reranking (if enabled and multiple results)
+            if self.reranker and len(results) > 1:
+                reranked_results = await self._rerank_results_with_bge(
+                    query=request.query,
+                    results=results,
+                    max_results=request.match_count
+                )
+                logger.info(f"Stage 2 (BGE Reranking): Reranked to {len(reranked_results)} results")
+            else:
+                reranked_results = results[:request.match_count]
+                if not self.reranker:
+                    logger.info("BGE Reranker disabled, using cosine similarity only")
 
             # Convert to response format
             search_results = [
@@ -201,13 +233,13 @@ class RAGService:
                     document_id=r["document_id"],
                     chunk_index=r["chunk_index"],
                     content=r["content"],
-                    similarity=r["similarity"],
+                    similarity=r.get("rerank_score", r["similarity"]),  # Use rerank score if available
                     metadata=r.get("metadata", {})
                 )
-                for r in results
+                for r in reranked_results
             ]
 
-            logger.info(f"Found {len(search_results)} results for query: {request.query}")
+            logger.info(f"Final results: {len(search_results)} chunks returned")
 
             return SearchKnowledgeBaseResponse(
                 results=search_results,
@@ -217,6 +249,77 @@ class RAGService:
         except Exception as e:
             logger.error(f"Failed to search knowledge base: {e}")
             raise
+
+    async def _rerank_results_with_bge(
+        self,
+        query: str,
+        results: List[Dict[str, Any]],
+        max_results: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Rerank search results using BGE reranker.
+
+        This uses a specialized reranking model to score query-passage relevance,
+        removing chunks that have high cosine similarity but are not contextually
+        relevant to the query.
+
+        Args:
+            query: Original search query
+            results: List of search results from vector similarity
+            max_results: Maximum number of results to return
+
+        Returns:
+            Reranked list of results with rerank_score added
+        """
+        if not results:
+            return []
+
+        # If we have very few results, skip reranking
+        if len(results) <= 2:
+            return results[:max_results]
+
+        try:
+            # Prepare query-passage pairs for reranker
+            # Format: [[query, passage1], [query, passage2], ...]
+            pairs = [[query, r["content"]] for r in results]
+
+            # Get reranking scores (normalized 0-1)
+            # Higher scores = more relevant
+            rerank_scores = self.reranker.compute_score(
+                pairs,
+                normalize=True  # Apply sigmoid to map scores to [0,1]
+            )
+
+            # Handle both single score and list of scores
+            if not isinstance(rerank_scores, list):
+                rerank_scores = [rerank_scores]
+
+            # Add rerank scores to results
+            for i, result in enumerate(results):
+                result["rerank_score"] = float(rerank_scores[i])
+                result["original_similarity"] = result["similarity"]  # Preserve original score
+
+            # Sort by rerank score (descending)
+            reranked = sorted(
+                results,
+                key=lambda x: x["rerank_score"],
+                reverse=True
+            )
+
+            # Log score distribution for monitoring
+            if reranked:
+                top_score = reranked[0]['rerank_score']
+                bottom_score = reranked[-1]['rerank_score']
+                logger.info(
+                    f"BGE Reranking - Top: {top_score:.3f}, Bottom: {bottom_score:.3f}, "
+                    f"Candidates: {len(results)} -> Results: {min(len(reranked), max_results)}"
+                )
+
+            return reranked[:max_results]
+
+        except Exception as e:
+            logger.error(f"BGE reranking failed: {e}. Returning original order.")
+            return results[:max_results]
 
     async def close(self):
         """Cleanup resources."""
